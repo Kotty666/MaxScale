@@ -83,7 +83,11 @@ router_options=mariadb10-compatibility=1
 This parameter is used to enable/disable incomplete transactions detection in binlog router.
 When MaxScale starts an error message may appear if current binlog file is corrupted or an incomplete transaction is found.
 During normal operations binlog events are not distributed to the slaves until a COMMIT is seen.
-The default value is on, set transaction_safety=off to completly disable the incomplete transactions detection.
+The default value is off, set transaction_safety=on to enable the incomplete transactions detection.
+
+### `send_slave_heartbeat`
+
+This defines whether (on | off) MaxSclale sends to the slave the heartbeat packet when there are no real binlog events to send. The default value if 'off', no heartbeat event is sent to slave server. If value is 'on' the interval value (requested by the slave during registration) is reported in the diagnostic output and the packect is send after the time interval without any event to send.
 
 A complete example of a service entry for a binlog router service would be as follows.
 ```
@@ -94,7 +98,7 @@ A complete example of a service entry for a binlog router service would be as fo
     version_string=5.6.17-log
     user=maxscale
     passwd=Mhu87p2D
-    router_options=uuid=f12fcb7f-b97b-11e3-bc5e-0401152c4c22,server-id=3,user=repl,password=slavepass,master-id=1,filestem=mybin,heartbeat=30,binlogdir=/var/binlogs,transaction_safety=1,master_version=5.6.19-common,master_hostname=common_server,master_uuid=xxx-fff-cccc-common,master-id=999,mariadb10-compatibility=1
+    router_options=uuid=f12fcb7f-b97b-11e3-bc5e-0401152c4c22,server-id=3,user=repl,password=slavepass,master-id=1,filestem=mybin,heartbeat=30,binlogdir=/var/binlogs,transaction_safety=1,master_version=5.6.19-common,master_hostname=common_server,master_uuid=xxx-fff-cccc-common,master-id=999,mariadb10-compatibility=1,send_slave_heartbeat=1
 ```
 
 The minimum set of router options that must be given in the configuration are are server-id and master-id, default values may be used for all other options.
