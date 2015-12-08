@@ -2369,6 +2369,8 @@ gw_write_SSL(SSL* ssl, const void *buf, size_t nbytes)
 {
     int w = 0;
     int ssl_error = SSL_ERROR_NONE;
+    bool have_data = false;
+
     do
     {
         w = SSL_write(ssl, buf, nbytes);
@@ -2379,9 +2381,29 @@ gw_write_SSL(SSL* ssl, const void *buf, size_t nbytes)
             switch (ssl_error)
             {
                 case SSL_ERROR_WANT_READ:
+                {
                     /** We need to read more data from the socket and call
                      * SSL_write again. */
+                    int fd = SSL_get_fd(ssl);
+                    int nbytes = 0;
+                    have_data = false;
+
+                    if (ioctl(fd, FIONREAD, &nbytes) == 0)
+                    {
+                        if (nbytes > 0)
+                        {
+                            have_data = true;
+                        }
+                    }
+                    else
+                    {
+                        w = -1;
+                        char errbuf[STRERROR_BUFLEN];
+                        MXS_ERROR("Call to ioctl failed: %d, %s", errno,
+                                  strerror_r(errno, errbuf, sizeof(errbuf)));
+                    }
                     break;
+                }
 
                 case SSL_ERROR_WANT_WRITE:
                     /** We need to wait for the client to send more data. */
@@ -2396,7 +2418,7 @@ gw_write_SSL(SSL* ssl, const void *buf, size_t nbytes)
             }
         }
     }
-    while (ssl_error == SSL_ERROR_WANT_READ);
+    while (ssl_error == SSL_ERROR_WANT_READ && have_data);
 
     return w;
 }
