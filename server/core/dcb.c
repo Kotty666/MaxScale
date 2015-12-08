@@ -116,6 +116,7 @@ static inline void dcb_write_tidy_up(DCB *dcb, bool below_water);
 static void dcb_write_SSL_error_report (DCB *dcb, int ret, int ssl_errno);
 int dcb_bytes_readable_SSL (DCB *dcb, int nread);
 void dcb_log_ssl_read_error(DCB *dcb, int ssl_errno, int rc);
+void dcb_log_ssl_write_error(int ssl_error);
 
 size_t dcb_get_session_id(
     DCB *dcb)
@@ -2361,22 +2362,44 @@ void dcb_hashtable_stats(
  * @param ssl           The SSL structure to use for writing
  * @param buf           Buffer to write
  * @param nbytes        Number of bytes to write
- * @return Number of written bytes
+ * @return Number of written bytes or -1 on error
  */
 int
 gw_write_SSL(SSL* ssl, const void *buf, size_t nbytes)
 {
     int w = 0;
-    int fd = SSL_get_fd(ssl);
-
-    if (fd > 0)
+    int ssl_error = SSL_ERROR_NONE;
+    do
     {
         w = SSL_write(ssl, buf, nbytes);
+
+        if (w <= 0)
+        {
+            ssl_error = SSL_get_error(ssl, w);
+            switch (ssl_error)
+            {
+                case SSL_ERROR_WANT_READ:
+                    /** We need to read more data from the socket and call
+                     * SSL_write again. */
+                    break;
+
+                case SSL_ERROR_WANT_WRITE:
+                    /** We need to wait for the client to send more data. */
+                    MXS_DEBUG("SSL renegotiation: Waiting for client write");
+                    w = 0;
+                    break;
+
+                default:
+                    dcb_log_ssl_write_error(ssl_error);
+                    w = -1;
+                    break;
+            }
+        }
     }
+    while (ssl_error == SSL_ERROR_WANT_READ);
+
     return w;
 }
-
-
 
 /**
  * Write data to a DCB
@@ -3261,6 +3284,33 @@ void dcb_log_ssl_read_error(DCB *dcb, int ssl_errno, int rc)
                 ERR_error_string_n(ssl_errno, errbuf, STRERROR_BUFLEN);
                 MXS_ERROR("%s", errbuf);
             }
+        }
+    }
+}
+
+/**
+ * Log SSL write error messages
+ *
+ * This function logs either the system call failure and the related errno or
+ * the SSL thread local error stack.
+ * @param ssl_error SSL error number
+ */
+void dcb_log_ssl_write_error(int ssl_error)
+{
+    char errbuf[STRERROR_BUFLEN];
+
+    if (ssl_error == SSL_ERROR_SYSCALL && errno != 0)
+    {
+        MXS_ERROR("SSL write error on system call: %s",
+                  strerror_r(errno, errbuf, sizeof(errbuf)));
+    }
+    else
+    {
+        int error;
+        while ((error = ERR_get_error()) != 0)
+        {
+            ERR_error_string_n(error, errbuf, sizeof(errbuf));
+            MXS_ERROR("SSL write error: %s", errbuf);
         }
     }
 }
