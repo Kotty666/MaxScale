@@ -1417,31 +1417,18 @@ dcb_write_SSL(DCB *dcb, GWBUF *queue)
 #if defined(FAKE_CODE)
             dcb_write_fake_code(dcb);
 #endif /* FAKE_CODE */
-            do
-            {
-                w = gw_write_SSL(dcb->ssl, GWBUF_DATA(queue), GWBUF_LENGTH(queue));
-                dcb->stats.n_writes++;
+            w = gw_write_SSL(dcb, GWBUF_DATA(queue), GWBUF_LENGTH(queue));
+            dcb->stats.n_writes++;
 
-                if (w <= 0)
-                {
-                    int ssl_errno = SSL_get_error(dcb->ssl, w);
-                    dcb_write_SSL_error_report(dcb, w, ssl_errno);
-                    if (ssl_errno != SSL_ERROR_WANT_WRITE)
-                    {
-                        atomic_add(&dcb->writeqlen, gwbuf_length(queue));
-                        dcb->stats.n_buffered++;
-                        dcb_write_tidy_up(dcb, below_water);
-                        return 1;
-                    }
-#ifdef SS_DEBUG
-                    else
-                    {
-                        MXS_DEBUG("SSL error: SSL_ERROR_WANT_WRITE, retrying SSL_write...");
-                    }
-#endif
-                }
+            if (w <= 0)
+            {
+                /** What wasn't successfully written is stored to write queue
+                 * for suspended write. */
+                atomic_add(&dcb->writeqlen, gwbuf_length(queue));
+                dcb->writeq = gwbuf_append(dcb->writeq, queue);
+                dcb->stats.n_buffered++;
+                break;
             }
-            while (w <= 0);
 
             /** Remove written bytes from the queue */
             queue = gwbuf_consume(queue, w);
@@ -1453,102 +1440,11 @@ dcb_write_SSL(DCB *dcb, GWBUF *queue)
                       STRDCBSTATE(dcb->state),
                       dcb->fd);
         } /*< while (queue != NULL) */
-        /*<
-         * What wasn't successfully written is stored to write queue
-         * for suspended write.
-         */
-        dcb->writeq = queue;
-
     } /* if (dcb->writeq) */
 
     dcb_write_tidy_up(dcb, below_water);
 
     return 1;
-}
-
-/**
- * General purpose routine to write error reports for SSL writes
- *
- * @param dcb   The DCB of the client
- * @param ret   The SSL operation return code
- * @param ssl_errno   The SSL error code
- */
-static void
-dcb_write_SSL_error_report(DCB *dcb, int ret, int ssl_errno)
-{
-    char errbuf[STRERROR_BUFLEN];
-
-    if (MXS_LOG_PRIORITY_IS_ENABLED(LOG_DEBUG))
-    {
-        switch(ssl_errno)
-        {
-        case SSL_ERROR_WANT_READ:
-            MXS_DEBUG("%lu [dcb_write] Write to dcb "
-                      "%p in state %s fd %d failed "
-                      "due error SSL_ERROR_WANT_READ",
-                      pthread_self(),
-                      dcb,
-                      STRDCBSTATE(dcb->state),
-                      dcb->fd);
-            break;
-        case SSL_ERROR_WANT_WRITE:
-            MXS_DEBUG("%lu [dcb_write] Write to dcb "
-                      "%p in state %s fd %d failed "
-                      "due error SSL_ERROR_WANT_WRITE",
-                      pthread_self(),
-                      dcb,
-                      STRDCBSTATE(dcb->state),
-                      dcb->fd);
-            break;
-        default:
-            MXS_DEBUG("%lu [dcb_write] Write to dcb "
-                      "%p in state %s fd %d failed "
-                      "due error %d",
-                      pthread_self(),
-                      dcb,
-                      STRDCBSTATE(dcb->state),
-                      dcb->fd,ssl_errno);
-            break;
-        }
-    }
-
-    if (MXS_LOG_PRIORITY_IS_ENABLED(LOG_ERR) && ssl_errno != SSL_ERROR_WANT_WRITE)
-    {
-        if (ret == -1)
-        {
-            MXS_ERROR("Write to dcb %p in "
-                      "state %s fd %d failed due to "
-                      "SSL error %d",
-                      dcb,
-                      STRDCBSTATE(dcb->state),
-                      dcb->fd,
-                      ssl_errno);
-            if (ssl_errno == SSL_ERROR_SSL || ssl_errno == SSL_ERROR_SYSCALL)
-            {
-                if (ssl_errno == SSL_ERROR_SYSCALL)
-                {
-                    MXS_ERROR("%d:%s", errno, strerror_r(errno, errbuf, sizeof(errbuf)));
-                }
-                do
-                {
-                    char errbuf[SSL_ERRBUF_LEN];
-                    ERR_error_string_n(ssl_errno,errbuf, sizeof(errbuf));
-                    MXS_ERROR("%d:%s", ssl_errno,errbuf);
-                }
-                while ((ssl_errno = ERR_get_error()) != 0);
-            }
-        }
-        else if (ret == 0)
-        {
-            do
-            {
-                char errbuf[SSL_ERRBUF_LEN];
-                ERR_error_string_n(ssl_errno,errbuf,sizeof(errbuf));
-                MXS_ERROR("%d:%s", ssl_errno,errbuf);
-            }
-            while ((ssl_errno = ERR_get_error()) != 0);
-        }
-    }
 }
 
 /**
@@ -1674,41 +1570,10 @@ dcb_drain_writeq_SSL(DCB *dcb)
         while (dcb->writeq != NULL)
         {
             len = GWBUF_LENGTH(dcb->writeq);
-            w = gw_write_SSL(dcb->ssl, GWBUF_DATA(dcb->writeq), len);
+            w = gw_write_SSL(dcb, GWBUF_DATA(dcb->writeq), len);
 
-            if (w < 0)
+            if (w <= 0)
             {
-                int ssl_errno = SSL_get_error(dcb->ssl,w);
-
-                if (ssl_errno == SSL_ERROR_WANT_WRITE || ssl_errno == SSL_ERROR_WANT_READ)
-                {
-                    break;
-                }
-                MXS_ERROR("Write to dcb failed due to SSL error %d:", ssl_errno);
-                switch(ssl_errno)
-                {
-                case SSL_ERROR_SSL:
-                case SSL_ERROR_SYSCALL:
-                    while ((ssl_errno = ERR_get_error()) != 0)
-                    {
-                        char errbuf[SSL_ERRBUF_LEN];
-                        ERR_error_string_n(ssl_errno,errbuf,sizeof(errbuf));
-                        MXS_ERROR("%s", errbuf);
-                    }
-                    if (errno != 0)
-                    {
-                        char errbuf[STRERROR_BUFLEN];
-                        MXS_ERROR("%d:%s", errno, strerror_r(errno, errbuf, sizeof(errbuf)));
-                    }
-                    break;
-                case SSL_ERROR_ZERO_RETURN:
-                    MXS_ERROR("Socket is closed.");
-                    break;
-
-                default:
-                    MXS_ERROR("Unexpected error.");
-                    break;
-                }
                 break;
             }
             /*
@@ -2362,53 +2227,43 @@ void dcb_hashtable_stats(
  * @param ssl           The SSL structure to use for writing
  * @param buf           Buffer to write
  * @param nbytes        Number of bytes to write
- * @return Number of written bytes or -1 on error
+ * @return Number of written bytes, -1 on error or 0 if the SSL renegotiation can't
+ * proceed with the data currently available.
  */
 int
-gw_write_SSL(SSL* ssl, const void *buf, size_t nbytes)
+gw_write_SSL(DCB* dcb, const void *buf, size_t nbytes)
 {
     int w = 0;
-    int ssl_error = SSL_ERROR_NONE;
-    bool have_data = false;
+    int ssl_error;
+    bool retry = false;
 
     do
     {
-        w = SSL_write(ssl, buf, nbytes);
+        ssl_error = SSL_ERROR_NONE;
+        w = SSL_write(dcb->ssl, buf, nbytes);
 
         if (w <= 0)
         {
-            ssl_error = SSL_get_error(ssl, w);
+            ssl_error = SSL_get_error(dcb->ssl, w);
             switch (ssl_error)
             {
                 case SSL_ERROR_WANT_READ:
                 {
-                    /** We need to read more data from the socket and call
-                     * SSL_write again. */
-                    int fd = SSL_get_fd(ssl);
-                    int nbytes = 0;
-                    have_data = false;
-
-                    if (ioctl(fd, FIONREAD, &nbytes) == 0)
+                    if (dcb_bytes_readable_SSL(dcb, 0) > 0)
                     {
-                        if (nbytes > 0)
-                        {
-                            have_data = true;
-                        }
+                        /** We need to read more data from the socket and call
+                         * SSL_write again. */
+                        retry = true;
                     }
                     else
                     {
-                        w = -1;
-                        char errbuf[STRERROR_BUFLEN];
-                        MXS_ERROR("Call to ioctl failed: %d, %s", errno,
-                                  strerror_r(errno, errbuf, sizeof(errbuf)));
+                        retry = false;
                     }
                     break;
                 }
-
                 case SSL_ERROR_WANT_WRITE:
-                    /** We need to wait for the client to send more data. */
-                    MXS_DEBUG("SSL renegotiation: Waiting for client write");
-                    w = 0;
+                    /** This will be handled when the write queue will be
+                     * drained. */
                     break;
 
                 default:
@@ -2418,8 +2273,7 @@ gw_write_SSL(SSL* ssl, const void *buf, size_t nbytes)
             }
         }
     }
-    while (ssl_error == SSL_ERROR_WANT_READ && have_data);
-
+    while (ssl_error == SSL_ERROR_WANT_READ && retry);
     return w;
 }
 
