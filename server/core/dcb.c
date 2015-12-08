@@ -116,7 +116,7 @@ static inline void dcb_write_tidy_up(DCB *dcb, bool below_water);
 static void dcb_write_SSL_error_report (DCB *dcb, int ret, int ssl_errno);
 int dcb_bytes_readable_SSL (DCB *dcb, int nread);
 void dcb_log_ssl_read_error(DCB *dcb, int ssl_errno, int rc);
-void dcb_log_ssl_write_error(int ssl_error);
+void dcb_log_ssl_error_stack(int ssl_error);
 
 size_t dcb_get_session_id(
     DCB *dcb)
@@ -2267,7 +2267,7 @@ gw_write_SSL(DCB* dcb, const void *buf, size_t nbytes)
                     break;
 
                 default:
-                    dcb_log_ssl_write_error(ssl_error);
+                    dcb_log_ssl_error_stack(ssl_error);
                     w = -1;
                     break;
             }
@@ -2886,85 +2886,54 @@ int dcb_create_SSL(DCB* dcb)
  */
 int dcb_accept_SSL(DCB* dcb)
 {
-    int rval = 0,ssl_rval,ssl_errnum = 0,fd,b = 0,pending;
-    int err_errnum;
-    char errbuf[SSL_ERRBUF_LEN];
-    fd = dcb->fd;
-
+    int rval = 0, ssl_error;
+    bool have_data = false;
     do
     {
-        ssl_rval = SSL_accept(dcb->ssl);
+        ssl_error = SSL_ERROR_NONE;
+        int ssl_rval = SSL_accept(dcb->ssl);
 
-        MXS_DEBUG("[dcb_accept_SSL] SSL_accept %d, error %d", ssl_rval,ssl_errnum);
-        switch(ssl_rval)
+        switch (ssl_rval)
         {
-        case 0:
-            ssl_errnum = SSL_get_error(dcb->ssl,ssl_rval);
-            MXS_ERROR("SSL authentication failed (SSL error %d):", ssl_errnum);
-
-            if (ssl_errnum == SSL_ERROR_SSL ||
-               ssl_errnum == SSL_ERROR_SYSCALL)
-            {
-                while ((err_errnum = ERR_get_error()) != 0)
-                {
-                    ERR_error_string_n(err_errnum,errbuf,sizeof(errbuf));
-                    MXS_ERROR("%s", errbuf);
-                }
-            }
-            rval = -1;
-            break;
-        case 1:
-            rval = 1;
-            MXS_DEBUG("[dcb_accept_SSL] SSL_accept done for %s", dcb->remote);
-            return rval;
-
-        case -1:
-            ssl_errnum = SSL_get_error(dcb->ssl,ssl_rval);
-
-            if (ssl_errnum == SSL_ERROR_WANT_READ || ssl_errnum == SSL_ERROR_WANT_WRITE)
-            {
-                /** Not all of the data has been read. Go back to the poll
-                    queue and wait for more.*/
-                rval = 0;
-                MXS_DEBUG("[dcb_accept_SSL] SSL_accept ongoing for %s", dcb->remote);
-                return rval;
-            }
-            else
-            {
+            case 0:
+                MXS_ERROR("Controlled SSL authentication failure. Printing SSL error stack:");
+                dcb_log_ssl_error_stack(SSL_get_error(dcb->ssl, ssl_rval));
                 rval = -1;
-                MXS_ERROR("Fatal error in SSL_accept for %s: (SSL version: %s SSL error code: %d)",
-                          dcb->remote,
-                          SSL_get_version(dcb->ssl),
-                          ssl_errnum);
-                if (ssl_errnum == SSL_ERROR_SSL ||
-                   ssl_errnum == SSL_ERROR_SYSCALL)
-                {
-                    while ((err_errnum = ERR_get_error()) != 0)
-                    {
-                        ERR_error_string_n(err_errnum,errbuf,sizeof(errbuf));
-                        MXS_ERROR("%s", errbuf);
-                    }
-                    if (errno)
-                    {
-                        MXS_ERROR("SSL authentication failed due to system"
-                                  " error %d: %s", errno, strerror_r(errno, errbuf, sizeof(errbuf)));
-                    }
-                }
-            }
-            break;
+                break;
 
-        default:
-            MXS_ERROR("Fatal library error in SSL_accept, returned value was %d.", ssl_rval);
-            rval = -1;
-            break;
+            case 1:
+                rval = 1;
+                MXS_DEBUG("SSL_accept done for %p:%s", dcb, dcb->remote);
+                break;
+
+            default:
+                ssl_error = SSL_get_error(dcb->ssl, ssl_rval);
+                switch (ssl_error)
+                {
+                    case SSL_ERROR_WANT_WRITE:
+                        /** Not all of the data has been read. Go back to the poll
+                         * queue and wait for more.*/
+                        rval = 0;
+                        MXS_DEBUG("[dcb_accept_SSL] SSL_accept ongoing for %s", dcb->remote);
+                        break;
+
+                    case SSL_ERROR_WANT_READ:
+                        have_data = dcb_bytes_readable_SSL(dcb, 0) > 0;
+                        rval = 0;
+                        break;
+
+                    default:
+                        rval = -1;
+                        MXS_ERROR("Fatal error in SSL_accept for %s "
+                                  "(SSL version: %s SSL error code: %d):",
+                                  dcb->remote, SSL_get_version(dcb->ssl), ssl_error);
+                        dcb_log_ssl_error_stack(ssl_error);
+                        break;
+                }
+                break;
         }
-        ioctl(fd,FIONREAD,&b);
-        pending = SSL_pending(dcb->ssl);
-#ifdef SS_DEBUG
-        MXS_DEBUG("[dcb_accept_SSL] fd %d: %d bytes, %d pending", fd, b, pending);
-#endif
     }
-    while ((b > 0 || pending > 0) && rval != -1);
+    while (ssl_error == SSL_ERROR_WANT_READ && have_data);
 
     return rval;
 }
@@ -3171,13 +3140,13 @@ void dcb_log_ssl_read_error(DCB *dcb, int ssl_errno, int rc)
  * the SSL thread local error stack.
  * @param ssl_error SSL error number
  */
-void dcb_log_ssl_write_error(int ssl_error)
+void dcb_log_ssl_error_stack(int ssl_error)
 {
     char errbuf[STRERROR_BUFLEN];
 
     if (ssl_error == SSL_ERROR_SYSCALL && errno != 0)
     {
-        MXS_ERROR("SSL write error on system call: %s",
+        MXS_ERROR("SSL error on system call: %s",
                   strerror_r(errno, errbuf, sizeof(errbuf)));
     }
     else
@@ -3186,7 +3155,7 @@ void dcb_log_ssl_write_error(int ssl_error)
         while ((error = ERR_get_error()) != 0)
         {
             ERR_error_string_n(error, errbuf, sizeof(errbuf));
-            MXS_ERROR("SSL write error: %s", errbuf);
+            MXS_ERROR("SSL error: %s", errbuf);
         }
     }
 }
