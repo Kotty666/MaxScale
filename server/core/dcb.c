@@ -116,7 +116,7 @@ static inline void dcb_write_tidy_up(DCB *dcb, bool below_water);
 static void dcb_write_SSL_error_report (DCB *dcb, int ret, int ssl_errno);
 int dcb_bytes_readable_SSL (DCB *dcb, int nread);
 void dcb_log_ssl_read_error(DCB *dcb, int ssl_errno, int rc);
-void dcb_log_ssl_error_stack(int ssl_error);
+void dcb_log_ssl_error_stack(int retval, int ssl_error, int stored_errno);
 
 size_t dcb_get_session_id(
     DCB *dcb)
@@ -2267,7 +2267,7 @@ gw_write_SSL(DCB* dcb, const void *buf, size_t nbytes)
                     break;
 
                 default:
-                    dcb_log_ssl_error_stack(ssl_error);
+                    dcb_log_ssl_error_stack(w, ssl_error, errno);
                     w = -1;
                     break;
             }
@@ -2896,8 +2896,9 @@ int dcb_accept_SSL(DCB* dcb)
         switch (ssl_rval)
         {
             case 0:
-                MXS_ERROR("Controlled SSL authentication failure. Printing SSL error stack:");
-                dcb_log_ssl_error_stack(SSL_get_error(dcb->ssl, ssl_rval));
+                ssl_error = SSL_get_error(dcb->ssl, ssl_rval);
+                MXS_ERROR("Controlled SSL authentication failure:");
+                dcb_log_ssl_error_stack(ssl_rval, ssl_error, errno);
                 rval = -1;
                 break;
 
@@ -2927,7 +2928,7 @@ int dcb_accept_SSL(DCB* dcb)
                         MXS_ERROR("Fatal error in SSL_accept for %s "
                                   "(SSL version: %s SSL error code: %d):",
                                   dcb->remote, SSL_get_version(dcb->ssl), ssl_error);
-                        dcb_log_ssl_error_stack(ssl_error);
+                        dcb_log_ssl_error_stack(ssl_rval, ssl_error, errno);
                         break;
                 }
                 break;
@@ -3139,23 +3140,38 @@ void dcb_log_ssl_read_error(DCB *dcb, int ssl_errno, int rc)
  * This function logs either the system call failure and the related errno or
  * the SSL thread local error stack.
  * @param ssl_error SSL error number
+ * @param stored_errno The value of errno at the time of the call
  */
-void dcb_log_ssl_error_stack(int ssl_error)
+void dcb_log_ssl_error_stack(int retval, int ssl_error, int stored_errno)
 {
     char errbuf[STRERROR_BUFLEN];
 
-    if (ssl_error == SSL_ERROR_SYSCALL && errno != 0)
+    if (ssl_error == SSL_ERROR_SYSCALL && stored_errno != 0 && retval == -1)
     {
-        MXS_ERROR("SSL error on system call: %s",
-                  strerror_r(errno, errbuf, sizeof(errbuf)));
+        MXS_ERROR("SSL error on system call: %d, %s", stored_errno,
+                  strerror_r(stored_errno, errbuf, sizeof(errbuf)));
     }
     else
     {
-        int error;
+        int error, nerrors = 0;
         while ((error = ERR_get_error()) != 0)
         {
             ERR_error_string_n(error, errbuf, sizeof(errbuf));
             MXS_ERROR("SSL error: %s", errbuf);
+            nerrors++;
+        }
+
+        if (nerrors == 0)
+        {
+            if (ssl_error == SSL_ERROR_SYSCALL && retval == 0)
+            {
+                MXS_ERROR("SSL failure due to unexpected EOF. Client did not "
+                    "send complete SSL protocol data.");
+            }
+            else
+            {
+                MXS_ERROR("SSL error %d with nothing in the error stack.", ssl_error);
+            }
         }
     }
 }
