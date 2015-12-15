@@ -33,6 +33,7 @@
 #include <sys/time.h>
 #include "skygw_utils.h"
 #include <atomic.h>
+#include <random_jkiss.h>
 #include <pcre2.h>
 
 #if defined(MLIST)
@@ -638,7 +639,7 @@ size_t snprint_timestamp(
         /** Generate timestamp */
 
         t = time(NULL);
-        tm = *(localtime(&t));
+        localtime_r(&t, &tm);
         snprintf(p_ts,
                  MIN(tslen,timestamp_len),
                  timestamp_formatstr,
@@ -686,7 +687,7 @@ size_t snprint_timestamp_hp(
         /** Generate timestamp */
 
         gettimeofday(&tv,NULL);
-        tm = *(localtime(&tv.tv_sec));
+        localtime_r(&tv.tv_sec, &tm);
         usec = tv.tv_usec/1000;
         snprintf(p_ts,
                  MIN(tslen,timestamp_len_hp),
@@ -1276,7 +1277,7 @@ void acquire_lock(
                 misscount += 1;
                 if (misscount > 10) 
 		{
-			ts1.tv_nsec = (rand()%misscount)*1000000;
+			ts1.tv_nsec = (random_jkiss()%misscount)*1000000;
 			nanosleep(&ts1, NULL);
                 }
         }
@@ -1708,7 +1709,7 @@ static bool file_write_header(
         t = (time_t *)malloc(sizeof(time_t));
         tm = (struct tm *)malloc(sizeof(struct tm));
         *t = time(NULL); 
-        *tm = *localtime(t);
+        localtime_r(t, tm);
         
         CHK_FILE(file);
         header_buf1 = "\n\nMariaDB Corporation MaxScale\t";

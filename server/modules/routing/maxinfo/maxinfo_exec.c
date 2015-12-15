@@ -293,7 +293,7 @@ char	errmsg[120];
 		tree->value[80] = 0;
 	sprintf(errmsg, "Unsupported show command '%s'", tree->value);
 	maxinfo_send_error(dcb, 0, errmsg);
-	LOGIF(LM, (skygw_log_write(LOGFILE_MESSAGE, errmsg)));
+	MXS_NOTICE("%s", errmsg);
 }
 
 /**
@@ -303,10 +303,7 @@ char	errmsg[120];
  */
 void exec_flush_logs(DCB *dcb, MAXINFO_TREE *tree)
 {
-    skygw_log_rotate(LE);
-    skygw_log_rotate(LM);
-    skygw_log_rotate(LT);
-    skygw_log_rotate(LD);
+    mxs_log_rotate();
     maxinfo_send_ok(dcb);
 }
 
@@ -348,7 +345,7 @@ exec_flush(DCB *dcb, MAXINFO_TREE *tree)
     }
     sprintf(errmsg, "Unsupported flush command '%s'", tree->value);
     maxinfo_send_error(dcb, 0, errmsg);
-    skygw_log_write(LE, errmsg);
+    MXS_ERROR("%s", errmsg);
 }
 
 /**
@@ -428,7 +425,7 @@ exec_set(DCB *dcb, MAXINFO_TREE *tree)
     }
     sprintf(errmsg, "Unsupported set command '%s'", tree->value);
     maxinfo_send_error(dcb, 0, errmsg);
-    skygw_log_write(LE, errmsg);
+    MXS_ERROR("%s", errmsg);
 }
 
 /**
@@ -508,7 +505,7 @@ exec_clear(DCB *dcb, MAXINFO_TREE *tree)
     }
     sprintf(errmsg, "Unsupported clear command '%s'", tree->value);
     maxinfo_send_error(dcb, 0, errmsg);
-    skygw_log_write(LE, errmsg);
+    MXS_ERROR("%s", errmsg);
 }
 
 extern void shutdown_server();
@@ -630,7 +627,7 @@ exec_shutdown(DCB *dcb, MAXINFO_TREE *tree)
     }
     sprintf(errmsg, "Unsupported shutdown command '%s'", tree->value);
     maxinfo_send_error(dcb, 0, errmsg);
-    skygw_log_write(LE, errmsg);
+    MXS_ERROR("%s", errmsg);
 }
 
 /**
@@ -738,7 +735,7 @@ exec_restart(DCB *dcb, MAXINFO_TREE *tree)
     }
     sprintf(errmsg, "Unsupported restart command '%s'", tree->value);
     maxinfo_send_error(dcb, 0, errmsg);
-    skygw_log_write(LE, errmsg);
+    MXS_ERROR("%s", errmsg);
 }
 
 /**

@@ -345,9 +345,6 @@ int	n_connect = 0;
 				client->remote = strdup(inet_ntoa(addr.sin_addr));
 				memcpy(&client->func, &MyObject, sizeof(GWPROTOCOL));
 
-				/* we don't need the session */
-				client->session = NULL;
-
 				/* create the session data for HTTPD */
 				client_data = (HTTPD_session *)calloc(1, sizeof(HTTPD_session));
 				client->data = client_data;
@@ -355,9 +352,10 @@ int	n_connect = 0;
 				client->session =
                                 	session_alloc(dcb->session->service, client);
 
-				if (poll_add_dcb(client) == -1)
+				if (NULL == client->session || poll_add_dcb(client) == -1)
 					{
 						close(so);
+                                                dcb_close(client);
 						return n_connect;
 					}
 				n_connect++;
@@ -413,9 +411,8 @@ int			syseno = 0;
 
 	if(syseno != 0){
                 char errbuf[STRERROR_BUFLEN];
-		skygw_log_write_flush(LOGFILE_ERROR,
-                                      "Error: Failed to set socket options. Error %d: %s",
-                                      errno, strerror_r(errno, errbuf, sizeof(errbuf)));
+		MXS_ERROR("Failed to set socket options. Error %d: %s",
+                          errno, strerror_r(errno, errbuf, sizeof(errbuf)));
 		return 0;
 	}
         /* set NONBLOCKING mode */
@@ -430,7 +427,7 @@ int			syseno = 0;
         rc = listen(listener->fd, SOMAXCONN);
         
         if (rc == 0) {
-            LOGIF(LM, (skygw_log_write_flush(LOGFILE_MESSAGE,"Listening httpd connections at %s", config)));
+            MXS_NOTICE("Listening httpd connections at %s", config);
         } else {
             int eno = errno;
             errno = 0;
@@ -494,7 +491,9 @@ static void httpd_send_headers(DCB *dcb, int final)
 	const char *fmt = "%a, %d %b %Y %H:%M:%S GMT";
 	time_t httpd_current_time = time(NULL);
 
-	strftime(date, sizeof(date), fmt, localtime(&httpd_current_time));
+        struct tm tm;
+        localtime_r(&httpd_current_time, &tm);
+	strftime(date, sizeof(date), fmt, &tm);
 
 	dcb_printf(dcb, "HTTP/1.1 200 OK\r\nDate: %s\r\nServer: %s\r\nConnection: close\r\nContent-Type: application/json\r\n", date, HTTP_SERVER_STRING);
 

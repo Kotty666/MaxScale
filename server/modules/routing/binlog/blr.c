@@ -46,8 +46,11 @@
  *					If set those values are sent to slaves instead of
  *					saved master responses
  * 23/08/2015	Massimiliano Pinto	Added strerror_r
+ * 09/09/2015   Martin Brampton         Modify error handler
  * 30/09/2015	Massimiliano Pinto	Addition of send_slave_heartbeat option
  * 23/10/2015	Markus Makela		Added current_safe_event
+ * 27/10/2015   Martin Brampton         Amend getCapabilities to return RCAP_TYPE_NO_RSESSION
+ * 26/11/2015	Massimiliano Pinto	Added check for missing service listener
  *
  * @endverbatim
  */
@@ -97,7 +100,7 @@ static  void    errorReply(
         error_action_t     action,
 	bool	*succp);
 
-static  uint8_t getCapabilities (ROUTER* inst, void* router_session);
+static  int getCapabilities ();
 static int blr_handler_config(void *userdata, const char *section, const char *name, const char *value);
 static int blr_handle_config_item(const char *name, const char *value, ROUTER_INSTANCE *inst);
 static int blr_set_service_mysql_user(SERVICE *service);
@@ -111,7 +114,6 @@ extern int blr_read_events_all_events(ROUTER_INSTANCE *router, int fix, int debu
 void blr_master_close(ROUTER_INSTANCE *);
 char * blr_last_event_description(ROUTER_INSTANCE *router);
 extern int MaxScaleUptime();
-static  uint8_t getCapabilities (ROUTER* inst, void* router_session);
 char	*blr_get_event_description(ROUTER_INSTANCE *router, uint8_t event);
 
 /** The module object definition */
@@ -156,9 +158,7 @@ version()
 void
 ModuleInit()
 {
-        LOGIF(LM, (skygw_log_write(
-                           LOGFILE_MESSAGE,
-                           "Initialise binlog router module %s.\n", version_str)));
+        MXS_NOTICE("Initialise binlog router module %s.\n", version_str);
         spinlock_init(&instlock);
 	instances = NULL;
 }
@@ -205,17 +205,24 @@ char		task_name[BLRM_TASK_NAME_LEN+1] = "";
 	if(service->credentials.name == NULL ||
 	   service->credentials.authdata == NULL)
 	{
-	    skygw_log_write(LE,"%s: Error: Service is missing user credentials."
-		    " Add the missing username or passwd parameter to the service.",
-			    service->name);
+	    MXS_ERROR("%s: Error: Service is missing user credentials."
+                      " Add the missing username or passwd parameter to the service.",
+                      service->name);
 	    return NULL;
 	}
 
 	if(options == NULL || options[0] == NULL)
 	{
-	    skygw_log_write(LE,
-		     "%s: Error: No router options supplied for binlogrouter",
-		     service->name);
+	    MXS_ERROR("%s: Error: No router options supplied for binlogrouter",
+                      service->name);
+	    return NULL;
+	}
+
+	/* Check for listeners associated to this service */
+	if (service->ports == NULL)
+	{
+	    MXS_ERROR("%s: Error: No listener configured for binlogrouter. Add a listener section in config file.",
+                      service->name);
 	    return NULL;
 	}
 
@@ -226,11 +233,10 @@ char		task_name[BLRM_TASK_NAME_LEN+1] = "";
 	 */
 	if (service->dbref != NULL)
 	{
-		LOGIF(LE, (skygw_log_write_flush(LOGFILE_ERROR,
-			"%s: Warning: backend database server is provided by master.ini file "
-			"for use with the binlog router."
-			" Server section is no longer required.",
-			service->name)));
+		MXS_WARNING("%s: backend database server is provided by master.ini file "
+			    "for use with the binlog router."
+			    " Server section is no longer required.",
+			    service->name);
 
 		server_free(service->dbref->server);
 		free(service->dbref);
@@ -238,9 +244,8 @@ char		task_name[BLRM_TASK_NAME_LEN+1] = "";
 	}
 
 	if ((inst = calloc(1, sizeof(ROUTER_INSTANCE))) == NULL) {
-		LOGIF(LE, (skygw_log_write_flush(LOGFILE_ERROR,
-			"%s: Error: failed to allocate memory for router instance.",
-			service->name)));
+		MXS_ERROR("%s: Error: failed to allocate memory for router instance.",
+                          service->name);
 
 		return NULL;
 	}
@@ -279,7 +284,7 @@ char		task_name[BLRM_TASK_NAME_LEN+1] = "";
 	inst->m_errno = 0;
 	inst->m_errmsg = NULL;
 
-	inst->trx_safe = 1;
+	inst->trx_safe = 0;
 	inst->pending_transaction = 0;
 	inst->last_safe_pos = 0;
 
@@ -327,10 +332,9 @@ char		task_name[BLRM_TASK_NAME_LEN+1] = "";
 		{
 			if ((value = strchr(options[i], '=')) == NULL)
 			{
-                            LOGIF(LE, (skygw_log_write(
-				LOGFILE_ERROR, "Warning : Unsupported router "
+                            MXS_WARNING("Unsupported router "
 					"option %s for binlog router.",
-					options[i])));
+					options[i]);
 			}
 			else
 			{
@@ -344,20 +348,16 @@ char		task_name[BLRM_TASK_NAME_LEN+1] = "";
 				{
 					inst->serverid = atoi(value);
 					if (strcmp(options[i], "server-id") == 0) {
-						LOGIF(LE, (skygw_log_write_flush(
-							LOGFILE_ERROR,
-							"WARNING: Configuration setting '%s' in router_options is deprecated"
-							" and will be removed in a later version of MaxScale. "
-							"Please use the new setting '%s' instead.",
-							"server-id", "server_id")));
+						MXS_WARNING("Configuration setting '%s' in router_options is deprecated"
+                                                            " and will be removed in a later version of MaxScale. "
+                                                            "Please use the new setting '%s' instead.",
+                                                            "server-id", "server_id");
 					}
 
 					if (inst->serverid <= 0) {
-						LOGIF(LE, (skygw_log_write_flush(
-							LOGFILE_ERROR,
-							"Error : Service %s, invalid server-id '%s'. "
-							"Please configure it with a unique positive integer value (1..2^32-1)",
-							service->name, value)));
+						MXS_ERROR("Service %s, invalid server-id '%s'. "
+                                                          "Please configure it with a unique positive integer value (1..2^32-1)",
+                                                          service->name, value);
 
 						free(inst);
 						return NULL;
@@ -383,12 +383,10 @@ char		task_name[BLRM_TASK_NAME_LEN+1] = "";
 						inst->set_master_server_id = strdup(value);
 					}
 					if (strcmp(options[i], "master-id") == 0) {
-						LOGIF(LE, (skygw_log_write_flush(
-							LOGFILE_ERROR,
-							"WARNING: Configuration setting '%s' in router_options is deprecated"
-							" and will be removed in a later version of MaxScale. "
-							"Please use the new setting '%s' instead.",
-							"master-id", "master_id")));
+						MXS_WARNING("Configuration setting '%s' in router_options is deprecated"
+                                                            " and will be removed in a later version of MaxScale. "
+                                                            "Please use the new setting '%s' instead.",
+                                                            "master-id", "master_id");
 					}
 				}
 				else if (strcmp(options[i], "master_uuid") == 0)
@@ -465,11 +463,9 @@ char		task_name[BLRM_TASK_NAME_LEN+1] = "";
 					int h_val = (int)strtol(value, NULL, 10);
 
 					if (h_val <= 0 || (errno == ERANGE)) {
-						LOGIF(LE, (skygw_log_write_flush(
-							LOGFILE_ERROR,
-							"Warning : invalid heartbeat period %s."
-							" Setting it to default value %d.",
-							value, inst->heartbeat )));
+						MXS_WARNING("Invalid heartbeat period %s."
+                                                            " Setting it to default value %ld.",
+                                                            value, inst->heartbeat);
 					} else {
 						inst->heartbeat = h_val;
 					}
@@ -484,20 +480,17 @@ char		task_name[BLRM_TASK_NAME_LEN+1] = "";
 				}
 				else
 				{
-					LOGIF(LE, (skygw_log_write(
-						LOGFILE_ERROR,
-						"Warning : Unsupported router "
-						"option %s for binlog router.",
-						options[i])));
+					MXS_WARNING("Unsupported router "
+                                                    "option %s for binlog router.",
+                                                    options[i]);
 				}
 			}
 		}
 	}
 	else
 	{
-		LOGIF(LE, (skygw_log_write(
-			LOGFILE_ERROR, "%s: Error: No router options supplied for binlogrouter",
-				service->name)));
+		MXS_ERROR("%s: Error: No router options supplied for binlogrouter",
+                          service->name);
 	}
 
 	if (inst->fileroot == NULL)
@@ -519,17 +512,16 @@ char		task_name[BLRM_TASK_NAME_LEN+1] = "";
 	strcpy(inst->prevbinlog, "");
 
 	if ((inst->binlogdir == NULL) || (inst->binlogdir != NULL && !strlen(inst->binlogdir))) {
-		skygw_log_write_flush(LOGFILE_ERROR,
-			"Error : Service %s, binlog directory is not specified",
-			service->name);
+		MXS_ERROR("Service %s, binlog directory is not specified",
+                          service->name);
 		free(inst);
 		return NULL;
 	}
 
 	if (inst->serverid <= 0) {
-		skygw_log_write_flush(LOGFILE_ERROR,
-			"Error : Service %s, server-id is not configured. Please configure it with a unique positive integer value (1..2^32-1)",
-			service->name, inst->serverid);
+		MXS_ERROR("Service %s, server-id is not configured. "
+                          "Please configure it with a unique positive integer value (1..2^32-1)",
+                          service->name);
 		free(inst);
 		return NULL;
 	}
@@ -543,12 +535,11 @@ char		task_name[BLRM_TASK_NAME_LEN+1] = "";
 		mkdir_rval = mkdir(inst->binlogdir, 0700);
 		if (mkdir_rval == -1) {
 			char err_msg[STRERROR_BUFLEN];
-			skygw_log_write_flush(LOGFILE_ERROR,
-				"Error : Service %s, Failed to create binlog directory '%s': [%d] %s",
-				service->name,
-				inst->binlogdir,
-				errno,
-				strerror_r(errno, err_msg, sizeof(err_msg)));
+			MXS_ERROR("Service %s, Failed to create binlog directory '%s': [%d] %s",
+                                  service->name,
+                                  inst->binlogdir,
+                                  errno,
+                                  strerror_r(errno, err_msg, sizeof(err_msg)));
 
 			free(inst);
 			return NULL;
@@ -559,9 +550,8 @@ char		task_name[BLRM_TASK_NAME_LEN+1] = "";
 	if (service->users == NULL) {
 		service->users = (void *)mysql_users_alloc();
 		if (service->users == NULL) {
-			LOGIF(LE, (skygw_log_write_flush(LOGFILE_ERROR,
-				"%s: Error allocating dbusers in createInstance",
-				inst->service->name)));
+			MXS_ERROR("%s: Error allocating dbusers in createInstance",
+                                  inst->service->name);
 
 			free(inst);
 			return NULL;
@@ -574,9 +564,8 @@ char		task_name[BLRM_TASK_NAME_LEN+1] = "";
 		SERVER *server;
 		server = server_alloc("_none_", "MySQLBackend", (int)3306);
 		if (server == NULL) {
-			LOGIF(LE, (skygw_log_write_flush(LOGFILE_ERROR,
-				"%s: Error for server_alloc in createInstance",
-				inst->service->name)));
+			MXS_ERROR("%s: Error for server_alloc in createInstance",
+                                  inst->service->name);
 			if (service->users) {
 				users_free(service->users);
                 service->users = NULL;
@@ -603,11 +592,10 @@ char		task_name[BLRM_TASK_NAME_LEN+1] = "";
 
 	rc = ini_parse(filename, blr_handler_config, inst);
 
-	LOGIF(LT, (skygw_log_write_flush(LOGFILE_TRACE,
-		"%s: %s parse result is %d",
-		inst->service->name,
-		filename,
-		rc)));
+	MXS_INFO("%s: %s parse result is %d",
+                 inst->service->name,
+                 filename,
+                 rc);
 
 	/*
 	 * retcode:
@@ -616,17 +604,15 @@ char		task_name[BLRM_TASK_NAME_LEN+1] = "";
 
 	if (rc != 0) {
 		if (rc == -1) {
-			LOGIF(LE, (skygw_log_write_flush(LOGFILE_ERROR,
-				"%s: master.ini file not found in %s."
-				" Master registration cannot be started."
-				" Configure with CHANGE MASTER TO ...",
-				inst->service->name, inst->binlogdir)));
+			MXS_ERROR("%s: master.ini file not found in %s."
+                                  " Master registration cannot be started."
+                                  " Configure with CHANGE MASTER TO ...",
+                                  inst->service->name, inst->binlogdir);
 		} else {
-			LOGIF(LE, (skygw_log_write_flush(LOGFILE_ERROR,
-				"%s: master.ini file with errors in %s."
-				" Master registration cannot be started."
-				" Fix errors in it or configure with CHANGE MASTER TO ...",
-				inst->service->name, inst->binlogdir)));
+			MXS_ERROR("%s: master.ini file with errors in %s."
+                                  " Master registration cannot be started."
+                                  " Fix errors in it or configure with CHANGE MASTER TO ...",
+                                  inst->service->name, inst->binlogdir);
 		}
 	
 		/* Set service user or load db users */
@@ -650,11 +636,9 @@ char		task_name[BLRM_TASK_NAME_LEN+1] = "";
 		/* Find latest binlog file or create a new one (000001) */
 		if (blr_file_init(inst) == 0)
 		{
-			LOGIF(LE, (skygw_log_write_flush(
-				LOGFILE_ERROR,
-				"%s: Service not started due to lack of binlog directory %s",
-				service->name,
-				inst->binlogdir)));
+			MXS_ERROR("%s: Service not started due to lack of binlog directory %s",
+                                  service->name,
+                                  inst->binlogdir);
 
 			if (service->users) {
 				users_free(service->users);
@@ -694,10 +678,8 @@ char		task_name[BLRM_TASK_NAME_LEN+1] = "";
 
 	/* Log whether the transaction safety option value is on*/
 	if (inst->trx_safe) {
-		LOGIF(LT, (skygw_log_write_flush(
-			LOGFILE_TRACE,
-			"%s: Service has transaction safety option set to ON",
-			service->name)));
+		MXS_INFO("%s: Service has transaction safety option set to ON",
+                         service->name);
 	}
 
 	/**
@@ -705,9 +687,8 @@ char		task_name[BLRM_TASK_NAME_LEN+1] = "";
 	 */
 	if (inst->master_state == BLRM_UNCONNECTED) {
 		/* Check current binlog */
-		LOGIF(LM, (skygw_log_write_flush(
-			LOGFILE_MESSAGE, "Validating binlog file '%s' ...",
-			inst->binlog_name)));
+		MXS_NOTICE("Validating binlog file '%s' ...",
+                           inst->binlog_name);
 
 		if (inst->trx_safe && !blr_check_binlog(inst)) {
 			/* Don't start replication, just return */
@@ -715,15 +696,11 @@ char		task_name[BLRM_TASK_NAME_LEN+1] = "";
 		}
 
 		if (!inst->trx_safe) {
-			LOGIF(LT, (skygw_log_write_flush(
-				LOGFILE_TRACE,
-				"Current binlog file is %s, current pos is %lu\n",
-				inst->binlog_name, inst->binlog_position)));
+			MXS_INFO("Current binlog file is %s, current pos is %lu\n",
+                                 inst->binlog_name, inst->binlog_position);
 		} else {
-			LOGIF(LT, (skygw_log_write_flush(
-				LOGFILE_TRACE,
-				"Current binlog file is %s, safe pos %lu, current pos is %lu\n",
-				inst->binlog_name, inst->binlog_position, inst->current_pos)));
+			MXS_INFO("Current binlog file is %s, safe pos %lu, current pos is %lu\n",
+                                 inst->binlog_name, inst->binlog_position, inst->current_pos);
 		}
 
 		/* Start replication from master server */
@@ -750,20 +727,16 @@ newSession(ROUTER *instance, SESSION *session)
 ROUTER_INSTANCE		*inst = (ROUTER_INSTANCE *)instance;
 ROUTER_SLAVE		*slave;
 
-        LOGIF(LD, (skygw_log_write_flush(
-                LOGFILE_DEBUG,
-                "binlog router: %lu [newSession] new router session with "
-                "session %p, and inst %p.",
-                pthread_self(),
-                session,
-                inst)));
+        MXS_DEBUG("binlog router: %lu [newSession] new router session with "
+                  "session %p, and inst %p.",
+                  pthread_self(),
+                  session,
+                  inst);
 
 
 	if ((slave = (ROUTER_SLAVE *)calloc(1, sizeof(ROUTER_SLAVE))) == NULL)
 	{
-		LOGIF(LE, (skygw_log_write_flush(
-			LOGFILE_ERROR,
-			"Insufficient memory to create new slave session for binlog router")));
+		MXS_ERROR("Insufficient memory to create new slave session for binlog router");
                 return NULL;
 	}
 
@@ -847,14 +820,12 @@ int			prev_val;
 	}
 	spinlock_release(&router->lock);
 
-        LOGIF(LD, (skygw_log_write_flush(
-                LOGFILE_DEBUG,
-                "%lu [freeSession] Unlinked router_client_session %p from "
-                "router %p. Connections : %d. ",
-                pthread_self(),
-                slave,
-                router,
-                prev_val-1)));
+        MXS_DEBUG("%lu [freeSession] Unlinked router_client_session %p from "
+                  "router %p. Connections : %d. ",
+                  pthread_self(),
+                  slave,
+                  router,
+                  prev_val-1);
 
 	if (slave->hostname)
 		free(slave->hostname);
@@ -884,16 +855,12 @@ ROUTER_SLAVE	 *slave = (ROUTER_SLAVE *)router_session;
 		/*
 		 * We must be closing the master session.
 		 */
-		LOGIF(LM, (skygw_log_write_flush(
-			LOGFILE_MESSAGE,
-			"%s: Master %s disconnected after %ld seconds. "
-			"%d events read,",
-			router->service->name, router->service->dbref->server->name,
-			time(0) - router->connect_time, router->stats.n_binlogs_ses)));
-        	LOGIF(LE, (skygw_log_write_flush(
-			LOGFILE_ERROR,
-			"Binlog router close session with master server %s",
-			router->service->dbref->server->unique_name)));
+		MXS_NOTICE("%s: Master %s disconnected after %ld seconds. "
+                           "%lu events read,",
+                           router->service->name, router->service->dbref->server->name,
+                           time(0) - router->connect_time, router->stats.n_binlogs_ses);
+        	MXS_ERROR("Binlog router close session with master server %s",
+                          router->service->dbref->server->unique_name);
 		blr_master_reconnect(router);
 		return;
 	}
@@ -908,27 +875,24 @@ ROUTER_SLAVE	 *slave = (ROUTER_SLAVE *)router_session;
 		atomic_add(&router->stats.n_registered, -1);
 
 		if (slave->state > 0) {
-			LOGIF(LM, (skygw_log_write_flush(
-				LOGFILE_MESSAGE,
-				"%s: Slave %s, server id %d, disconnected after %ld seconds. "
-				"%d SQL commands, %d events sent (%lu bytes), binlog '%s', last position %lu",
-				router->service->name, slave->dcb->remote,
-				slave->serverid,
-				time(0) - slave->connect_time,
-				slave->stats.n_queries,
-				slave->stats.n_events,
-				slave->stats.n_bytes,
-				slave->binlogfile,
-				(unsigned long)slave->binlog_pos)));
+			MXS_NOTICE("%s: Slave %s:%d, server id %d, disconnected after %ld seconds. "
+                                 "%d SQL commands, %d events sent (%lu bytes), binlog '%s', "
+                                   "last position %lu",
+                                   router->service->name, slave->dcb->remote, ntohs((slave->dcb->ipv4).sin_port),
+                                   slave->serverid,
+                                   time(0) - slave->connect_time,
+                                   slave->stats.n_queries,
+                                   slave->stats.n_events,
+                                   slave->stats.n_bytes,
+                                   slave->binlogfile,
+                                   (unsigned long)slave->binlog_pos);
 		} else {
-			LOGIF(LM, (skygw_log_write_flush(
-				LOGFILE_MESSAGE,
-				"%s: Slave %s, server id %d, disconnected after %ld seconds. "
-				"%d SQL commands",
-				router->service->name, slave->dcb->remote,
-				slave->serverid,
-				time(0) - slave->connect_time,
-				slave->stats.n_queries)));
+			MXS_NOTICE("%s: Slave %s, server id %d, disconnected after %ld seconds. "
+                                   "%d SQL commands",
+                                   router->service->name, slave->dcb->remote,
+                                   slave->serverid,
+                                   time(0) - slave->connect_time,
+                                   slave->stats.n_queries);
 		}
 
 		/*
@@ -942,14 +906,6 @@ ROUTER_SLAVE	 *slave = (ROUTER_SLAVE *)router_session;
 
                 /* Unlock */
                 rses_end_locked_router_action(slave);
-
-		/**
-		 * Close the slave server connection
-		 */
-                if (slave->dcb != NULL) {
-                        CHK_DCB(slave->dcb);
-                        dcb_close(slave->dcb);
-                }
         }
 }
 
@@ -1132,12 +1088,11 @@ struct tm	tm;
 		if (!router_inst->mariadb10_compat) {
 			dcb_printf(dcb, "\tLast event from master:  			0x%x, %s\n",
 				router_inst->lastEventReceived,
-				(router_inst->lastEventReceived >= 0 && 
-				router_inst->lastEventReceived <= MAX_EVENT_TYPE) ?
+				(router_inst->lastEventReceived <= MAX_EVENT_TYPE) ?
 				event_names[router_inst->lastEventReceived] : "unknown");
 		} else {
 			char *ptr = NULL;
-			if (router_inst->lastEventReceived >= 0 && router_inst->lastEventReceived <= MAX_EVENT_TYPE) {
+			if (router_inst->lastEventReceived <= MAX_EVENT_TYPE) {
 				ptr = event_names[router_inst->lastEventReceived];
 			} else {
 				/* Check MariaDB 10 new events */
@@ -1391,8 +1346,8 @@ int	len;
  * @param       router_session  The router session
  * @param       message         The error message to reply
  * @param       backend_dcb     The backend DCB
- * @param       action     	The action: REPLY, REPLY_AND_CLOSE, NEW_CONNECTION
- * @param	succp		Result of action
+ * @param       action     	The action: ERRACT_NEW_CONNECTION or ERRACT_REPLY_CLIENT
+ * @param	succp		Result of action: true iff router can continue
  *
  */
 static  void
@@ -1404,12 +1359,6 @@ socklen_t	len;
 char		msg[STRERROR_BUFLEN + 1 + 5] = "";
 char 		*errmsg;
 unsigned long	mysql_errno;
-
-	if (action == ERRACT_RESET)
-	{
-		backend_dcb->dcb_errhandle_called = false;
-		return;
-	}
 
 	/** Don't handle same error twice on same DCB */
         if (backend_dcb->dcb_errhandle_called)
@@ -1444,32 +1393,29 @@ unsigned long	mysql_errno;
 			free(router->m_errmsg);
 		router->m_errmsg = strdup(errmsg);
 
-	       	LOGIF(LE, (skygw_log_write_flush(
-			LOGFILE_ERROR, "%s: Master connection error %lu '%s' in state '%s', "
-				"%sattempting reconnect to master %s:%d",
-				router->service->name, mysql_errno, errmsg,
-				blrm_states[router->master_state], msg,
-				router->service->dbref->server->name,
-				router->service->dbref->server->port)));
+	       	MXS_ERROR("%s: Master connection error %lu '%s' in state '%s', "
+                          "%sattempting reconnect to master %s:%d",
+                          router->service->name, mysql_errno, errmsg,
+                          blrm_states[router->master_state], msg,
+                          router->service->dbref->server->name,
+                          router->service->dbref->server->port);
 	} else {
-       		LOGIF(LE, (skygw_log_write_flush(
-			LOGFILE_ERROR, "%s: Master connection error %lu '%s' in state '%s', "
-				"%sattempting reconnect to master %s:%d",
-				router->service->name, router->m_errno, router->m_errmsg,
-				blrm_states[router->master_state], msg,
-				router->service->dbref->server->name,
-				router->service->dbref->server->port)));
+       		MXS_ERROR("%s: Master connection error %lu '%s' in state '%s', "
+                          "%sattempting reconnect to master %s:%d",
+                          router->service->name, router->m_errno, router->m_errmsg,
+                          blrm_states[router->master_state], msg,
+                          router->service->dbref->server->name,
+                          router->service->dbref->server->port);
 	}
 
 	if (errmsg)
 		free(errmsg);
 	*succp = true;
-	LOGIF(LM, (skygw_log_write_flush(
-		LOGFILE_MESSAGE,
-		"%s: Master %s disconnected after %ld seconds. "
-		"%d events read.",
-		router->service->name, router->service->dbref->server->name,
-		time(0) - router->connect_time, router->stats.n_binlogs_ses)));
+        dcb_close(backend_dcb);
+	MXS_NOTICE("%s: Master %s disconnected after %ld seconds. "
+                   "%lu events read.",
+                   router->service->name, router->service->dbref->server->name,
+                   time(0) - router->connect_time, router->stats.n_binlogs_ses);
 	blr_master_reconnect(router);
 }
 
@@ -1522,9 +1468,9 @@ static void rses_end_locked_router_action(ROUTER_SLAVE	* rses)
 }
 
 
-static uint8_t getCapabilities(ROUTER *inst, void *router_session)
+static int getCapabilities()
 {
-        return 0;
+        return RCAP_TYPE_NO_RSESSION;
 }
 
 /**
@@ -1737,10 +1683,10 @@ SERVICE         *service;
 	{
 		return blr_handle_config_item(name, value, inst);
 	} else  {
-		LOGIF(LE, (skygw_log_write_flush(LOGFILE_ERROR,
-			"Error : master.ini has an invalid section [%s], it should be [binlog_configuration]. Service %s",
-			section,	
-			service->name)));
+		MXS_ERROR("master.ini has an invalid section [%s], it should be [binlog_configuration]. "
+                          "Service %s",
+                          section,
+                          service->name);
 
 		return 0;
 	}
@@ -1799,9 +1745,8 @@ char	*service_user = NULL;
 char	*service_passwd = NULL;
 
 	if (serviceGetUser(service, &service_user, &service_passwd) == 0) {
-		LOGIF(LE, (skygw_log_write_flush(LOGFILE_ERROR,
-			"failed to get service user details for service %s",
-			service->name)));
+		MXS_ERROR("failed to get service user details for service %s",
+                          service->name);
 
 		return 1;
 	}
@@ -1809,10 +1754,9 @@ char	*service_passwd = NULL;
 	dpwd = decryptPassword(service->credentials.authdata);
 
 	if (!dpwd) {
-		LOGIF(LE, (skygw_log_write_flush(LOGFILE_ERROR,
-			"decrypt password failed for service user %s, service %s",
-			service_user,
-			service->name)));
+		MXS_ERROR("decrypt password failed for service user %s, service %s",
+                          service_user,
+                          service->name);
 
 		return 1;
         }
@@ -1820,9 +1764,8 @@ char	*service_passwd = NULL;
 	newpasswd = create_hex_sha1_sha1_passwd(dpwd);
 
 	if (!newpasswd) {
-		LOGIF(LE, (skygw_log_write_flush(LOGFILE_ERROR,
-			"create hex_sha1_sha1_password failed for service user %s",
-			service_user)));
+		MXS_ERROR("create hex_sha1_sha1_password failed for service user %s",
+                          service_user);
 
 		free(dpwd);
 		return 1;
@@ -1862,10 +1805,8 @@ SERVICE *service;
 
 	if (loaded < 0)
 	{
-		LOGIF(LE, (skygw_log_write_flush(
-			LOGFILE_ERROR,
-			"Error : Unable to load users for service %s",
-			service->name)));
+		MXS_ERROR("Unable to load users for service %s",
+                          service->name);
 
 		/* Try loading authentication data from file cache */
 
@@ -1873,29 +1814,23 @@ SERVICE *service;
 
 		if (loaded != -1)
 		{
-			LOGIF(LE, (skygw_log_write_flush(
-				LOGFILE_ERROR,
-				"Service %s, Using cached credential information file %s.",
-				service->name,
-				path)));
+			MXS_ERROR("Service %s, Using cached credential information file %s.",
+                                  service->name,
+                                  path);
 		} else {
-			LOGIF(LE, (skygw_log_write_flush(
-				LOGFILE_ERROR,
-				"Error: Service %s, Unable to read cache credential information from %s."
-				" No database user added to service users table.",
-				service->name,
-				path)));
+			MXS_ERROR("Service %s, Unable to read cache credential information from %s."
+                                  " No database user added to service users table.",
+                                  service->name,
+                                  path);
 		}
 	} else {
 		/* don't update cache if no user was loaded */
 		if (loaded == 0)
 		{
-			LOGIF(LE, (skygw_log_write_flush(
-				LOGFILE_ERROR,
-				"Service %s: failed to load any user "
-				"information. Authentication will "
-				"probably fail as a result.",
-				service->name)));
+			MXS_ERROR("Service %s: failed to load any user "
+                                  "information. Authentication will "
+                                  "probably fail as a result.",
+                                  service->name);
 		} else {
 			/* update cached data */
 			blr_save_dbusers(router);
@@ -1939,12 +1874,11 @@ int	mkdir_rval = 0;
 	if (mkdir_rval == -1)
 	{
 		char err_msg[STRERROR_BUFLEN];
-		skygw_log_write(LOGFILE_ERROR,
-			"Error : Service %s, Failed to create directory '%s': [%d] %s",
-			service->name,
-			path,
-			errno,
-			strerror_r(errno, err_msg, sizeof(err_msg)));
+		MXS_ERROR("Service %s, Failed to create directory '%s': [%d] %s",
+                          service->name,
+                          path,
+                          errno,
+                          strerror_r(errno, err_msg, sizeof(err_msg)));
 
 		return -1;
 	}
@@ -2002,9 +1936,7 @@ static int blr_check_binlog(ROUTER_INSTANCE *router) {
 
 	n = blr_read_events_all_events(router, 0, 0);
 
-	LOGIF(LD, (skygw_log_write_flush(
-		LOGFILE_DEBUG,
-		"blr_read_events_all_events() ret = %i\n", n)));
+	MXS_DEBUG("blr_read_events_all_events() ret = %i\n", n);
 
 	if (n != 0) {
 		char msg_err[BINLOG_ERROR_MSG_LEN + 1] = "";
@@ -2020,11 +1952,9 @@ static int blr_check_binlog(ROUTER_INSTANCE *router) {
 		/* set last_safe_pos */
 		router->last_safe_pos = router->binlog_position;
 
-		LOGIF(LE, (skygw_log_write_flush(
-			LOGFILE_ERROR,
-			"Error found in binlog file %s. Safe starting pos is %lu",
-			router->binlog_name,
-			router->binlog_position)));
+		MXS_ERROR("Error found in binlog file %s. Safe starting pos is %lu",
+                          router->binlog_name,
+                          router->binlog_position);
 
 		return 0;
 	} else {
@@ -2044,13 +1974,11 @@ blr_last_event_description(ROUTER_INSTANCE *router) {
 char *event_desc = NULL;
 
 	if (!router->mariadb10_compat) {
-		if (router->lastEventReceived >= 0 &&
-			router->lastEventReceived <= MAX_EVENT_TYPE) {
+		if (router->lastEventReceived <= MAX_EVENT_TYPE) {
 			event_desc = event_names[router->lastEventReceived];
 		}
 	} else {
-		if (router->lastEventReceived >= 0 &&
-			router->lastEventReceived <= MAX_EVENT_TYPE) {
+		if (router->lastEventReceived <= MAX_EVENT_TYPE) {
 			event_desc = event_names[router->lastEventReceived];
 		} else {
 			/* Check MariaDB 10 new events */
@@ -2076,13 +2004,11 @@ blr_get_event_description(ROUTER_INSTANCE *router, uint8_t event) {
 char *event_desc = NULL;
 
 	if (!router->mariadb10_compat) {
-		if (event >= 0 &&
-			event <= MAX_EVENT_TYPE) {
+		if (event <= MAX_EVENT_TYPE) {
 			event_desc = event_names[event];
 		}
 	} else {
-		if (event >= 0 &&
-			event <= MAX_EVENT_TYPE) {
+		if (event <= MAX_EVENT_TYPE) {
 			event_desc = event_names[event];
 		} else {
 			/* Check MariaDB 10 new events */

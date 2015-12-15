@@ -65,6 +65,9 @@ MODULE_INFO 	info = {
  * 18/07/2013	Massimiliano Pinto	routeQuery now handles COM_QUIT
  *					as QUERY_TYPE_SESSION_WRITE
  * 17/07/2014	Massimiliano Pinto	Server connection counter is updated in closeSession
+ * 
+ * 09/09/2015   Martin Brampton         Modify error handler
+ * 25/09/2015   Martin Brampton         Block callback processing when no router session in the DCB
  *
  * @endverbatim
  */
@@ -127,7 +130,7 @@ static bool route_single_stmt(
 	GWBUF*             querybuf);
 
 
-static  uint8_t getCapabilities (ROUTER* inst, void* router_session);
+static  int getCapabilities();
 
 #if defined(NOT_USED)
 static bool router_option_configured(
@@ -369,9 +372,7 @@ version()
 void
 ModuleInit()
 {
-        LOGIF(LM, (skygw_log_write_flush(
-                           LOGFILE_MESSAGE,
-                           "Initializing statemend-based read/write split router module.")));
+        MXS_NOTICE("Initializing statemend-based read/write split router module.");
         spinlock_init(&instlock);
         instances = NULL;
 }
@@ -515,25 +516,21 @@ static void refreshInstance(
         {
                 if (rlag_limited)
                 {
-                        LOGIF(LE, (skygw_log_write_flush(
-                                LOGFILE_ERROR,
-                                "Warning : Configuration Failed, max_slave_replication_lag "
+                    MXS_WARNING("Configuration Failed, max_slave_replication_lag "
                                 "is set to %d,\n\t\t      but detect_replication_lag "
                                 "is not enabled. Replication lag will not be checked.",
-                                router->rwsplit_config.rw_max_slave_replication_lag)));
+                                router->rwsplit_config.rw_max_slave_replication_lag);
                 }
             
                 if (router->rwsplit_config.rw_slave_select_criteria == 
                         LEAST_BEHIND_MASTER)
                 {
-                        LOGIF(LE, (skygw_log_write_flush(
-                                LOGFILE_ERROR,
-                                "Warning : Configuration Failed, router option "
+                    MXS_WARNING("Configuration Failed, router option "
                                 "\n\t\t      slave_selection_criteria=LEAST_BEHIND_MASTER "
                                 "is specified, but detect_replication_lag "
                                 "is not enabled.\n\t\t      "
                                 "slave_selection_criteria=%s will be used instead.",
-                                STRCRITERIA(DEFAULT_CRITERIA))));
+                                STRCRITERIA(DEFAULT_CRITERIA));
                         
                         router->rwsplit_config.rw_slave_select_criteria =
                                 DEFAULT_CRITERIA;
@@ -623,63 +620,78 @@ createInstance(SERVICE *service, char **options)
 	 */
 	router->available_slaves = true;
 
-	/*
-	 * If server weighting has been defined calculate the percentage
-	 * of load that will be sent to each server. This is only used for
-	 * calculating the least connections, either globally or within a
-	 * service, or the number of current operations on a server.
-	 */
-	if ((weightby = serviceGetWeightingParameter(service)) != NULL)
-	{
-		int 	n, total = 0;
-		BACKEND	*backend;
+    /*
+     * If server weighting has been defined calculate the percentage
+     * of load that will be sent to each server. This is only used for
+     * calculating the least connections, either globally or within a
+     * service, or the number of current operations on a server.
+     */
+    if ((weightby = serviceGetWeightingParameter(service)) != NULL)
+    {
+        int total = 0;
 
-		for (n = 0; router->servers[n]; n++)
-		{
-			backend = router->servers[n];
-			total += atoi(serverGetParameter(
-					backend->backend_server, weightby));
-		}
-		if (total == 0)
-		{
-			LOGIF(LE, (skygw_log_write(LOGFILE_ERROR,
-				"WARNING: Weighting Parameter for service '%s' "
-				"will be ignored as no servers have values "
-				"for the parameter '%s'.\n",
-				service->name, weightby)));
-		}
-		else
-		{
-			for (n = 0; router->servers[n]; n++)
-			{
-				int perc;
-				int wght;
-				backend = router->servers[n];
-				wght = atoi(serverGetParameter(backend->backend_server,
-							       weightby));
-				perc = (wght*1000) / total;
-					
-				if (perc == 0 && wght != 0)
-				{
-					perc = 1;
-				}
-				backend->weight = perc;
+        for (int n = 0; router->servers[n]; n++)
+        {
+            BACKEND *backend = router->servers[n];
+            char *param = serverGetParameter(backend->backend_server, weightby);
+            if (param)
+            {
+                total += atoi(param);
+            }
+        }
+        if (total == 0)
+        {
+            MXS_WARNING("Weighting Parameter for service '%s' "
+                        "will be ignored as no servers have values "
+                        "for the parameter '%s'.",
+                        service->name, weightby);
+        }
+        else if (total < 0)
+        {
+            MXS_ERROR("Sum of weighting parameter '%s' for service '%s' exceeds "
+                      "maximum value of %d. Weighting will be ignored.",
+                      weightby, service->name, INT_MAX);
+        }
+        else
+        {
+            for (int n = 0; router->servers[n]; n++)
+            {
+                BACKEND *backend = router->servers[n];
+                char *param = serverGetParameter(backend->backend_server, weightby);
+                if (param)
+                {
+                    int wght = atoi(param);
+                    int perc = (wght * 1000) / total;
 
-				if (perc == 0)
-				{
-					LOGIF(LE, (skygw_log_write(
-						LOGFILE_ERROR,
-						"Server '%s' has no value "
-						"for weighting parameter '%s', "
-						"no queries will be routed to "
-						"this server.\n",
-						router->servers[n]->backend_server->unique_name,
-						weightby)));
-				}
-			}
-		}
-	}
-        
+                    if (perc == 0)
+                    {
+                        perc = 1;
+                        MXS_ERROR("Weighting parameter '%s' with a value of %d for"
+                                  " server '%s' rounds down to zero with total weight"
+                                  " of %d for service '%s'. No queries will be "
+                                  "routed to this server.", weightby, wght,
+                                  backend->backend_server->unique_name, total,
+                                  service->name);
+                    }
+                    else if (perc < 0)
+                    {
+                        MXS_ERROR("Weighting parameter '%s' for server '%s' is too large, "
+                                  "maximum value is %d. No weighting will be used for this server.",
+                                  weightby, backend->backend_server->unique_name, INT_MAX / 1000);
+                        perc = 1000;
+                    }
+                    backend->weight = perc;
+                }
+                else
+                {
+                    MXS_WARNING("Server '%s' has no parameter '%s' used for weighting"
+                                " for service '%s'.", backend->backend_server->unique_name,
+                                weightby, service->name);
+                }
+            }
+        }
+    }
+
         /**
          * vraa : is this necessary for readwritesplit ?
          * Option : where can a read go?
@@ -704,12 +716,12 @@ createInstance(SERVICE *service, char **options)
 	    router->rwsplit_config.rw_max_sescmd_history_size = 0;
 	}
 
-	/** 
-         * Set default value for max_slave_connections and for slave selection
-         * criteria. If parameter is set in config file max_slave_connections 
-         * will be overwritten.
+        /**
+         * Set default value for max_slave_connections as 100%. This way
+         * LEAST_CURRENT_OPERATIONS allows us to balance evenly across all the
+         * configured slaves.
          */
-        router->rwsplit_config.rw_max_slave_conn_count = CONFIG_MAX_SLAVE_CONN;
+        router->rwsplit_config.rw_max_slave_conn_count = nservers;
         
         if (router->rwsplit_config.rw_slave_select_criteria == UNDEFINED_CRITERIA)
         {
@@ -909,7 +921,6 @@ static void* newSession(
         client_rses->rses_master_ref   = master_ref;
 	/* assert with master_host */
 	ss_dassert(master_ref && (master_ref->bref_backend->backend_server && SERVER_MASTER));
-        client_rses->rses_capabilities = RCAP_TYPE_STMT_INPUT;
         client_rses->rses_backend_ref  = backend_ref;
         client_rses->rses_nbackends    = router_nservers; /*< # of backend servers */
 
@@ -962,9 +973,7 @@ static void closeSession(
         ROUTER_CLIENT_SES* router_cli_ses;
         backend_ref_t*     backend_ref;
 
-	LOGIF(LD, (skygw_log_write(LOGFILE_DEBUG,
-			   "%lu [RWSplit:closeSession]",
-			    pthread_self())));                                
+	MXS_DEBUG("%lu [RWSplit:closeSession]", pthread_self());
 	
         /** 
          * router session can be NULL if newSession failed and it is discarding
@@ -987,7 +996,7 @@ static void closeSession(
 		int i;
                 /** 
                  * This sets router closed. Nobody is allowed to use router
-                 * whithout checking this first.
+                 * without checking this first.
                  */
                 router_cli_ses->rses_closed = true;
 
@@ -1142,8 +1151,7 @@ static bool get_dcb(
 	master_host = get_root_master(backend_ref, rses->rses_nbackends);
 	if (master_bref->bref_backend != master_host)
 	{
-		LOGIF(LT, (skygw_log_write(LOGFILE_TRACE,
-			"Master has changed.")));
+            MXS_INFO("Master has changed.");
 	}
 #endif
 	if (name != NULL) /*< Choose backend by name from a hint */
@@ -1267,13 +1275,11 @@ static bool get_dcb(
 				}
 				else
 				{
-					LOGIF(LT, (skygw_log_write(
-						LOGFILE_TRACE,
-						"Server %s:%d is too much behind the "
-						"master, %d s. and can't be chosen.",
-						b->backend_server->name,
-						b->backend_server->port,
-						b->backend_server->rlag)));
+                                    MXS_INFO("Server %s:%d is too much behind the "
+                                             "master, %d s. and can't be chosen.",
+                                             b->backend_server->name,
+                                             b->backend_server->port,
+                                             b->backend_server->rlag);
 				}
 			}
 		} /*<  for */
@@ -1301,13 +1307,11 @@ static bool get_dcb(
 		}
 		else
 		{
-			LOGIF(LE, (skygw_log_write_flush(
-				LOGFILE_ERROR,
-				"Error : Server at %s:%d should be master but "
-				"is %s instead and can't be chosen to master.",
-				master_bref->bref_backend->backend_server->name,
-				master_bref->bref_backend->backend_server->port,
-				STRSRVSTATUS(master_bref->bref_backend->backend_server))));
+                    MXS_ERROR("Server at %s:%d should be master but "
+                              "is %s instead and can't be chosen to master.",
+                              master_bref->bref_backend->backend_server->name,
+                              master_bref->bref_backend->backend_server->port,
+                              STRSRVSTATUS(master_bref->bref_backend->backend_server));
 			succp = false;
 		}
         }
@@ -1404,15 +1408,13 @@ static route_target_t get_route_target (
 		 !( QUERY_IS_TYPE(qtype, QUERY_TYPE_PREPARE_STMT) ||
 		    QUERY_IS_TYPE(qtype, QUERY_TYPE_PREPARE_NAMED_STMT)))
 		{
-			LOGIF(LE, (skygw_log_write_flush(
-				LOGFILE_ERROR,
-				"Warning : The query can't be routed to all "
+                    MXS_WARNING("The query can't be routed to all "
 				"backend servers because it includes SELECT and "
 				"SQL variable modifications which is not supported. "
 				"Set use_sql_variables_in=master or split the "
 				"query to two, where SQL variable modifications "
 				"are done in the first and the SELECT in the "
-				"second one.")));
+				"second one.");
 			
 			target = TARGET_MASTER;
 		}
@@ -1427,6 +1429,8 @@ static route_target_t get_route_target (
 		QUERY_IS_TYPE(qtype, QUERY_TYPE_USERVAR_READ)||	/*< read user var */
 		QUERY_IS_TYPE(qtype, QUERY_TYPE_SYSVAR_READ) ||	/*< read sys var */
 		QUERY_IS_TYPE(qtype, QUERY_TYPE_EXEC_STMT) ||   /*< prepared stmt exec */
+		QUERY_IS_TYPE(qtype, QUERY_TYPE_PREPARE_STMT) ||
+		QUERY_IS_TYPE(qtype, QUERY_TYPE_PREPARE_NAMED_STMT) ||
 		QUERY_IS_TYPE(qtype, QUERY_TYPE_GSYSVAR_READ))) /*< read global sys var */
 	{
 		/** First set expected targets before evaluating hints */
@@ -1444,6 +1448,8 @@ static route_target_t get_route_target (
 
                 if (QUERY_IS_TYPE(qtype, QUERY_TYPE_MASTER_READ) ||
 			QUERY_IS_TYPE(qtype, QUERY_TYPE_EXEC_STMT)	||
+		    QUERY_IS_TYPE(qtype, QUERY_TYPE_PREPARE_STMT) ||
+		    QUERY_IS_TYPE(qtype, QUERY_TYPE_PREPARE_NAMED_STMT) ||
 			/** Configured not to allow reading variables from slaves */
 			(use_sql_variables_in == TYPE_MASTER && 
 			(QUERY_IS_TYPE(qtype, QUERY_TYPE_USERVAR_READ)	||
@@ -1457,10 +1463,8 @@ static route_target_t get_route_target (
 			if (hint->type == HINT_ROUTE_TO_MASTER)
 			{
 				target = TARGET_MASTER; /*< override */
-				LOGIF(LD, (skygw_log_write(
-					LOGFILE_DEBUG,
-					"%lu [get_route_target] Hint: route to master.",
-					pthread_self())));
+				MXS_DEBUG("%lu [get_route_target] Hint: route to master.",
+                                          pthread_self());
 				break;
 			}
 			else if (hint->type == HINT_ROUTE_TO_NAMED_SERVER)
@@ -1470,11 +1474,9 @@ static route_target_t get_route_target (
 				 * found, the oroginal target is chosen.
 				 */
 				target |= TARGET_NAMED_SERVER;
-				LOGIF(LD, (skygw_log_write(
-					LOGFILE_DEBUG,
-					"%lu [get_route_target] Hint: route to "
-					"named server : ",
-					pthread_self())));
+				MXS_DEBUG("%lu [get_route_target] Hint: route to "
+                                          "named server : ",
+                                          pthread_self());
 			}
 			else if (hint->type == HINT_ROUTE_TO_UPTODATE_SERVER)
 			{
@@ -1495,28 +1497,18 @@ static route_target_t get_route_target (
 				}
 				else
 				{
-					LOGIF(LT, (skygw_log_write(
-						LOGFILE_TRACE,
-						"Error : Unknown hint parameter "
-						"'%s' when 'max_slave_replication_lag' "
-						"was expected.",
-						(char *)hint->data)));
-					LOGIF(LE, (skygw_log_write_flush(
-						LOGFILE_ERROR,
-						"Error : Unknown hint parameter "
-						"'%s' when 'max_slave_replication_lag' "
-						"was expected.",
-						(char *)hint->data)));                                        
+                                    MXS_ERROR("Unknown hint parameter "
+                                              "'%s' when 'max_slave_replication_lag' "
+                                              "was expected.",
+                                              (char *)hint->data);
 				}
 			}
 			else if (hint->type == HINT_ROUTE_TO_SLAVE)
 			{
 				target = TARGET_SLAVE;
-				LOGIF(LD, (skygw_log_write(
-					LOGFILE_DEBUG,
-					"%lu [get_route_target] Hint: route to "
-					"slave.",
-					pthread_self())));                                
+				MXS_DEBUG("%lu [get_route_target] Hint: route to "
+                                          "slave.",
+                                          pthread_self());
 			}
 			hint = hint->next;
 		} /*< while (hint != NULL) */
@@ -1553,10 +1545,7 @@ static route_target_t get_route_target (
 		target = TARGET_MASTER;
 	}
 #if defined(SS_EXTRA_DEBUG)
-	LOGIF(LT, (skygw_log_write(
-		LOGFILE_TRACE,
-		"Selected target \"%s\"",
-		STRTARGET(target))));
+        MXS_INFO("Selected target \"%s\"", STRTARGET(target));
 #endif
 	return target;
 }
@@ -1584,15 +1573,15 @@ void check_drop_tmp_table(
 
   if(router_cli_ses == NULL || querybuf == NULL)
   {
-      skygw_log_write(LE,"[%s] Error: NULL parameters passed: %p %p",
-		      __FUNCTION__,router_cli_ses,querybuf);
+      MXS_ERROR("[%s] Error: NULL parameters passed: %p %p",
+                __FUNCTION__,router_cli_ses,querybuf);
       return;
   }
 
   if(router_cli_ses->rses_master_ref == NULL)
   {
-      skygw_log_write(LE,"[%s] Error: Master server reference is NULL.",
-		      __FUNCTION__);
+      MXS_ERROR("[%s] Error: Master server reference is NULL.",
+                __FUNCTION__);
       return;
   }
 
@@ -1601,9 +1590,9 @@ void check_drop_tmp_table(
 
   if(master_dcb == NULL || master_dcb->session == NULL)
   {
-      skygw_log_write(LE,"[%s] Error: Master server DBC is NULL. "
-	      "This means that the connection to the master server is already "
-	      "closed while a query is still being routed.",__FUNCTION__);
+      MXS_ERROR("[%s] Error: Master server DBC is NULL. "
+                "This means that the connection to the master server is already "
+                "closed while a query is still being routed.",__FUNCTION__);
       return;
   }
 
@@ -1613,7 +1602,7 @@ void check_drop_tmp_table(
 
   if(data == NULL)
   {
-      skygw_log_write(LE,"[%s] Error: User data in master server DBC is NULL.",__FUNCTION__);
+      MXS_ERROR("[%s] Error: User data in master server DBC is NULL.",__FUNCTION__);
       return;
   }
 
@@ -1637,8 +1626,7 @@ void check_drop_tmp_table(
 						  if (hashtable_delete(rses_prop_tmp->rses_prop_data.temp_tables, 
 											   (void *)hkey))
 							  {
-								  LOGIF(LT, (skygw_log_write(LOGFILE_TRACE,
-															 "Temporary table dropped: %s",hkey)));
+                                                              MXS_INFO("Temporary table dropped: %s",hkey);
 							  }
 					  }
 				  free(tbl[i]);
@@ -1676,15 +1664,15 @@ static skygw_query_type_t is_read_tmp_table(
 
   if(router_cli_ses == NULL || querybuf == NULL)
   {
-      skygw_log_write(LE,"[%s] Error: NULL parameters passed: %p %p",
-		      __FUNCTION__,router_cli_ses,querybuf);
+      MXS_ERROR("[%s] Error: NULL parameters passed: %p %p",
+                __FUNCTION__,router_cli_ses,querybuf);
       return type;
   }
 
   if(router_cli_ses->rses_master_ref == NULL)
   {
-      skygw_log_write(LE,"[%s] Error: Master server reference is NULL.",
-		      __FUNCTION__);
+      MXS_ERROR("[%s] Error: Master server reference is NULL.",
+                __FUNCTION__);
       return type;
   }
 
@@ -1693,9 +1681,9 @@ static skygw_query_type_t is_read_tmp_table(
 
   if(master_dcb == NULL || master_dcb->session == NULL)
   {
-      skygw_log_write(LE,"[%s] Error: Master server DBC is NULL. "
-	      "This means that the connection to the master server is already "
-	      "closed while a query is still being routed.",__FUNCTION__);
+      MXS_ERROR("[%s] Error: Master server DBC is NULL. "
+                "This means that the connection to the master server is already "
+                "closed while a query is still being routed.",__FUNCTION__);
       return qtype;
   }
   CHK_DCB(master_dcb);
@@ -1704,7 +1692,7 @@ static skygw_query_type_t is_read_tmp_table(
 
   if(data == NULL)
   {
-      skygw_log_write(LE,"[%s] Error: User data in master server DBC is NULL.",__FUNCTION__);
+      MXS_ERROR("[%s] Error: User data in master server DBC is NULL.",__FUNCTION__);
       return qtype;
   }
 
@@ -1732,10 +1720,8 @@ static skygw_query_type_t is_read_tmp_table(
 		       (bool)hashtable_fetch(rses_prop_tmp->rses_prop_data.temp_tables,(void *)hkey)))
 		    {
 		      /**Query target is a temporary table*/
-		      qtype = QUERY_TYPE_READ_TMP_TABLE;			
-		      LOGIF(LT, 
-			    (skygw_log_write(LOGFILE_TRACE,
-					     "Query targets a temporary table: %s",hkey)));
+		      qtype = QUERY_TYPE_READ_TMP_TABLE;
+		      MXS_INFO("Query targets a temporary table: %s",hkey);
 		    }
 		}
 	    }
@@ -1778,15 +1764,15 @@ static void check_create_tmp_table(
 
   if(router_cli_ses == NULL || querybuf == NULL)
   {
-      skygw_log_write(LE,"[%s] Error: NULL parameters passed: %p %p",
-		      __FUNCTION__,router_cli_ses,querybuf);
+      MXS_ERROR("[%s] Error: NULL parameters passed: %p %p",
+                __FUNCTION__,router_cli_ses,querybuf);
       return;
   }
 
   if(router_cli_ses->rses_master_ref == NULL)
   {
-      skygw_log_write(LE,"[%s] Error: Master server reference is NULL.",
-		      __FUNCTION__);
+      MXS_ERROR("[%s] Error: Master server reference is NULL.",
+                __FUNCTION__);
       return;
   }
 
@@ -1795,9 +1781,9 @@ static void check_create_tmp_table(
 
   if(master_dcb == NULL || master_dcb->session == NULL)
   {
-      skygw_log_write(LE,"[%s] Error: Master server DCB is NULL. "
-	      "This means that the connection to the master server is already "
-	      "closed while a query is still being routed.",__FUNCTION__);
+      MXS_ERROR("[%s] Error: Master server DCB is NULL. "
+                "This means that the connection to the master server is already "
+                "closed while a query is still being routed.",__FUNCTION__);
       return;
   }
 
@@ -1807,7 +1793,7 @@ static void check_create_tmp_table(
 
   if(data == NULL)
   {
-      skygw_log_write(LE,"[%s] Error: User data in master server DBC is NULL.",__FUNCTION__);
+      MXS_ERROR("[%s] Error: User data in master server DBC is NULL.",__FUNCTION__);
       return;
   }
 
@@ -1851,7 +1837,7 @@ static void check_create_tmp_table(
 	    }
 	  else
 		{
-		  LOGIF(LE, (skygw_log_write_flush(LOGFILE_ERROR,"Error : Call to malloc() failed.")));
+                    MXS_ERROR("Call to malloc() failed.");
 		}
 	}
 	  if(rses_prop_tmp){
@@ -1863,7 +1849,7 @@ static void check_create_tmp_table(
 	    {
 	      rses_prop_tmp->rses_prop_data.temp_tables = h;
 	    }else{
-		  LOGIF(LE, (skygw_log_write_flush(LOGFILE_ERROR,"Error : Failed to allocate a new hashtable.")));
+              MXS_ERROR("Failed to allocate a new hashtable.");
 	  }
 
 	}
@@ -1873,10 +1859,7 @@ static void check_create_tmp_table(
 			(void *)hkey,
 			(void *)is_temp) == 0) /*< Conflict in hash table */
 	{
-	  LOGIF(LT, (skygw_log_write(
-				     LOGFILE_TRACE,
-				     "Temporary table conflict in hashtable: %s",
-				     hkey)));
+            MXS_INFO("Temporary table conflict in hashtable: %s", hkey);
 	}
 #if defined(SS_DEBUG)
       {
@@ -1886,10 +1869,7 @@ static void check_create_tmp_table(
 			  hkey);
 	if (retkey)
 	  {
-	    LOGIF(LT, (skygw_log_write(
-				       LOGFILE_TRACE,
-				       "Temporary table added: %s",
-				       hkey)));
+              MXS_INFO("Temporary table added: %s", hkey);
 	  }
       }
 #endif
@@ -2009,12 +1989,10 @@ static int routeQuery(
 				{
 					char* query_str = modutil_get_query(querybuf);
 					
-					LOGIF(LE, (skygw_log_write_flush(
-						LOGFILE_ERROR,
-						"Error: Can't route %s:\"%s\" to "
-						"backend server. Router is closed.",
-						STRPACKETTYPE(packet_type),
-						(query_str == NULL ? "(empty)" : query_str))));
+					MXS_ERROR("Can't route %s:\"%s\" to "
+                                                  "backend server. Router is closed.",
+                                                  STRPACKETTYPE(packet_type),
+                                                  (query_str == NULL ? "(empty)" : query_str));
 					free(query_str);
 				}
 			}
@@ -2043,12 +2021,10 @@ static int routeQuery(
 		{
 			char* query_str = modutil_get_query(querybuf);
 			
-			LOGIF(LE, (skygw_log_write_flush(
-				LOGFILE_ERROR,
-				"Error: Can't route %s:\"%s\" to "
-				"backend server. Router is closed.",
-				STRPACKETTYPE(packet_type),
-				(query_str == NULL ? "(empty)" : query_str))));
+			MXS_ERROR("Can't route %s:\"%s\" to "
+                                  "backend server. Router is closed.",
+                                  STRPACKETTYPE(packet_type),
+                                  (query_str == NULL ? "(empty)" : query_str));
 			free(query_str);
 		}
 	}
@@ -2070,11 +2046,8 @@ retblock:
                 
                 if (canonical_query_str != NULL)
                 {
-                        LOGIF(LT, (skygw_log_write(
-                                LOGFILE_TRACE,
-                                "Canonical version: %s",
-                                canonical_query_str)));
-                        free(canonical_query_str);
+                    MXS_INFO("Canonical version: %s", canonical_query_str);
+                    free(canonical_query_str);
                 }
         }
 #endif
@@ -2123,14 +2096,12 @@ static bool route_single_stmt(
 	{
 		char* query_str = modutil_get_query(querybuf);
 		CHK_DCB(master_dcb);
-		LOGIF(LE, (skygw_log_write_flush(
-			LOGFILE_ERROR,
-			"Error: Can't route %s:%s:\"%s\" to "
-			"backend server. Session doesn't have a Master "
-			"node",
-			STRPACKETTYPE(packet_type),
-			STRQTYPE(qtype),
-			(query_str == NULL ? "(empty)" : query_str))));
+		MXS_ERROR("Can't route %s:%s:\"%s\" to "
+                          "backend server. Session doesn't have a Master "
+                          "node",
+                          STRPACKETTYPE(packet_type),
+                          STRQTYPE(qtype),
+                          (query_str == NULL ? "(empty)" : query_str));
 		free(query_str);
 		succp = false;
 		goto retblock;
@@ -2146,8 +2117,8 @@ static bool route_single_stmt(
 	    packet_type = MYSQL_COM_UNDEFINED;
         rses->rses_load_active = false;
         route_target = TARGET_MASTER;
-        skygw_log_write_flush(LT, "> LOAD DATA LOCAL INFILE finished: "
-            "%lu bytes sent.", rses->rses_load_data_sent + gwbuf_length(querybuf));
+        MXS_INFO("> LOAD DATA LOCAL INFILE finished: "
+                 "%lu bytes sent.", rses->rses_load_data_sent + gwbuf_length(querybuf));
 	}
 	else
 	{
@@ -2265,7 +2236,7 @@ static bool route_single_stmt(
 		rses->rses_transaction_active = false;
 	}        
 	
-	if (LOG_IS_ENABLED(LOGFILE_TRACE))
+	if (MXS_LOG_PRIORITY_IS_ENABLED(LOG_INFO))
 	{
         if (!rses->rses_load_active)
             {
@@ -2277,24 +2248,23 @@ static bool route_single_stmt(
                 char* contentstr = strndup(data, MIN(len, RWSPLIT_TRACE_MSG_LEN));
                 char* qtypestr = skygw_get_qtype_str(qtype);
 
-                skygw_log_write(LOGFILE_TRACE,
-                                "> Autocommit: %s, trx is %s, cmd: %s, type: %s, "
-                                "stmt: %s%s %s",
-                                (rses->rses_autocommit_enabled ? "[enabled]" : "[disabled]"),
-                                (rses->rses_transaction_active ? "[open]" : "[not open]"),
-                                STRPACKETTYPE(ptype),
-                                (qtypestr == NULL ? "N/A" : qtypestr),
-                                contentstr,
-                                (querybuf->hint == NULL ? "" : ", Hint:"),
-                                (querybuf->hint == NULL ? "" : STRHINTTYPE(querybuf->hint->type)));
+                MXS_INFO("> Autocommit: %s, trx is %s, cmd: %s, type: %s, "
+                         "stmt: %s%s %s",
+                         (rses->rses_autocommit_enabled ? "[enabled]" : "[disabled]"),
+                         (rses->rses_transaction_active ? "[open]" : "[not open]"),
+                         STRPACKETTYPE(ptype),
+                         (qtypestr == NULL ? "N/A" : qtypestr),
+                         contentstr,
+                         (querybuf->hint == NULL ? "" : ", Hint:"),
+                         (querybuf->hint == NULL ? "" : STRHINTTYPE(querybuf->hint->type)));
 
                 free(contentstr);
                 free(qtypestr);
             }
             else
             {
-                skygw_log_write(LT, "> Processing LOAD DATA LOCAL INFILE: "
-                                "%lu bytes sent.", rses->rses_load_data_sent);
+                MXS_INFO("> Processing LOAD DATA LOCAL INFILE: "
+                         "%lu bytes sent.", rses->rses_load_data_sent);
             }
 	}
 	/** 
@@ -2331,21 +2301,18 @@ static bool route_single_stmt(
 			char* query_str = modutil_get_query(querybuf);
 			char* qtype_str = skygw_get_qtype_str(qtype);
 			
-			LOGIF(LE, (skygw_log_write_flush(
-				LOGFILE_ERROR,
-				"Error : Can't route %s:%s:\"%s\". SELECT with "
-				"session data modification is not supported "
-				"if configuration parameter "
-				"use_sql_variables_in=all .",
-				STRPACKETTYPE(packet_type),
-				qtype_str,
-				(query_str == NULL ? "(empty)" : query_str))));
+			MXS_ERROR("Can't route %s:%s:\"%s\". SELECT with "
+                                  "session data modification is not supported "
+                                  "if configuration parameter "
+                                  "use_sql_variables_in=all .",
+                                  STRPACKETTYPE(packet_type),
+                                  qtype_str,
+                                  (query_str == NULL ? "(empty)" : query_str));
 			
-			LOGIF(LT, (skygw_log_write(LOGFILE_TRACE, 
-						   "Unable to route the query "
-						   "without losing session data "
-						   "modification from other "
-						   "servers. <")));
+			MXS_INFO("Unable to route the query "
+                                 "without losing session data "
+                                 "modification from other "
+                                 "servers. <");
 			
 			while (bref != NULL && !BREF_IS_IN_USE(bref))
 			{
@@ -2369,12 +2336,10 @@ static bool route_single_stmt(
 				 * If there were no available backend references
 				 * available return false - session will be closed
 				 */
-				LOGIF(LE, (skygw_log_write_flush(
-					LOGFILE_ERROR,
-					"Error : Sending error message to client "
-					"failed. Router doesn't have any "
-					"available backends. Session will be "
-					"closed.")));
+                                MXS_ERROR("Sending error message to client "
+                                          "failed. Router doesn't have any "
+                                          "available backends. Session will be "
+                                          "closed.");
 				succp = false;
 			}
 			if (query_str) free (query_str);
@@ -2407,13 +2372,11 @@ static bool route_single_stmt(
 		{
 			char* query_str = modutil_get_query(querybuf);
 			
-			LOGIF(LE, (skygw_log_write_flush(
-				LOGFILE_ERROR,
-				"Error: Can't route %s:%s:\"%s\" to "
-				"backend server. Router is closed.",
-				STRPACKETTYPE(packet_type),
-				STRQTYPE(qtype),
-				(query_str == NULL ? "(empty)" : query_str))));
+			MXS_ERROR("Can't route %s:%s:\"%s\" to "
+                                  "backend server. Router is closed.",
+                                  STRPACKETTYPE(packet_type),
+                                  STRQTYPE(qtype),
+                                  (query_str == NULL ? "(empty)" : query_str));
 			free(query_str);
 		}
 		succp = false;
@@ -2441,11 +2404,9 @@ static bool route_single_stmt(
 				 * backend server.
 				 */
 				named_server = hint->data;
-				LOGIF(LT, (skygw_log_write(
-					LOGFILE_TRACE,
-					"Hint: route to server "
-					"'%s'",
-					named_server)));       
+				MXS_INFO("Hint: route to server "
+                                         "'%s'",
+                                         named_server);
 			}
 			else if (hint->type == HINT_PARAMETER &&
 				(strncasecmp((char *)hint->data,
@@ -2463,11 +2424,9 @@ static bool route_single_stmt(
 					 * value for backend srv
 					 */
 					rlag_max = val;
-					LOGIF(LT, (skygw_log_write(
-						LOGFILE_TRACE,
-						"Hint: "
-						"max_slave_replication_lag=%d",
-						rlag_max)));
+					MXS_INFO("Hint: "
+                                                 "max_slave_replication_lag=%d",
+                                                 rlag_max);
 				}
 			}
 			hint = hint->next;
@@ -2488,21 +2447,17 @@ static bool route_single_stmt(
 		{
 			if (TARGET_IS_NAMED_SERVER(route_target))
 			{
-				LOGIF(LT, (skygw_log_write(
-					LOGFILE_TRACE,
-					"Was supposed to route to named server "
-					"%s but couldn't find the server in a "
-					"suitable state.",
-					named_server)));
+                            MXS_INFO("Was supposed to route to named server "
+                                     "%s but couldn't find the server in a "
+                                     "suitable state.",
+                                     named_server);
 			}
 			else if (TARGET_IS_RLAG_MAX(route_target))
 			{
-				LOGIF(LT, (skygw_log_write(
-					LOGFILE_TRACE,
-					"Was supposed to route to server with "
-					"replication lag at most %d but couldn't "
-					"find such a slave.",
-					rlag_max)));
+                            MXS_INFO("Was supposed to route to server with "
+                                     "replication lag at most %d but couldn't "
+                                     "find such a slave.",
+                                     rlag_max);
 			}
 		}
 	}
@@ -2522,8 +2477,7 @@ static bool route_single_stmt(
 		if (succp)
 		{
 #if defined(SS_EXTRA_DEBUG)
-			LOGIF(LT, (skygw_log_write(LOGFILE_TRACE,
-						   "Found DCB for slave.")));
+                        MXS_INFO("Found DCB for slave.");
 #endif
 			ss_dassert(get_root_master_bref(rses) == 
 				rses->rses_master_ref);
@@ -2531,10 +2485,9 @@ static bool route_single_stmt(
 		}
 		else
 		{
-			LOGIF(LT, (skygw_log_write(LOGFILE_TRACE,
-						   "Was supposed to route to slave"
-						   "but finding suitable one "
-						   "failed.")));
+                    MXS_INFO("Was supposed to route to slave"
+                             "but finding suitable one "
+                             "failed.");
 		}
 	}
 	else if (TARGET_IS_MASTER(route_target))
@@ -2556,20 +2509,14 @@ static bool route_single_stmt(
 		{
 			if (succp && master_dcb != curr_master_dcb)
 			{
-				LOGIF(LT, (skygw_log_write(LOGFILE_TRACE,
-							   "Was supposed to "
-							   "route to master "
-							   "but master has "
-							   "changed.")));
+                            MXS_INFO("Was supposed to route to master "
+                                     "but master has changed.");
 			}
 			else
 			{
-				LOGIF(LT, (skygw_log_write(LOGFILE_TRACE,
-							   "Was supposed to "
-							   "route to master "
-							   "but couldn't find "
-							   "master in a "
-							   "suitable state.")));
+                            MXS_INFO("Was supposed to route to master "
+                                     "but couldn't find master in a "
+                                     "suitable state.");
 			}
 			/**
 			 * Master has changed. Return with error indicator.
@@ -2590,13 +2537,11 @@ static bool route_single_stmt(
 		
 		ss_dassert(target_dcb != NULL);
 		
-		LOGIF(LT, (skygw_log_write(
-			LOGFILE_TRACE,
-			"Route query to %s \t%s:%d <",
-			(SERVER_IS_MASTER(bref->bref_backend->backend_server) ? 
-			"master" : "slave"),
-			bref->bref_backend->backend_server->name,
-			bref->bref_backend->backend_server->port)));
+		MXS_INFO("Route query to %s \t%s:%d <",
+                         (SERVER_IS_MASTER(bref->bref_backend->backend_server) ?
+                          "master" : "slave"),
+                         bref->bref_backend->backend_server->name,
+                         bref->bref_backend->backend_server->port);
 		/** 
 		 * Store current stmt if execution of previous session command 
 		 * haven't completed yet.
@@ -2634,9 +2579,7 @@ static bool route_single_stmt(
 		}
 		else
 		{
-			LOGIF((LE|LT), (skygw_log_write_flush(
-				LOGFILE_ERROR,
-				"Error : Routing query failed.")));
+                        MXS_ERROR("Routing query failed.");
 			succp = false;
 		}
 	}
@@ -2651,10 +2594,7 @@ retblock:
 		
 		if (canonical_query_str != NULL)
 		{
-			LOGIF(LT, (skygw_log_write(
-				LOGFILE_TRACE,
-				"Canonical version: %s",
-				canonical_query_str)));
+                        MXS_INFO("Canonical version: %s", canonical_query_str);
 			free(canonical_query_str);
 		}
 	}
@@ -2888,7 +2828,7 @@ static void clientReply (
          */
 	if (sescmd_cursor_is_active(scur))
 	{
-                if (LOG_IS_ENABLED(LOGFILE_ERROR) && 
+                if (MXS_LOG_PRIORITY_IS_ENABLED(LOG_ERR) && 
                         MYSQL_IS_ERROR_PACKET(((uint8_t *)GWBUF_DATA(writebuf))))
                 {
                         uint8_t* buf = 
@@ -2903,14 +2843,12 @@ static void clientReply (
 			
                         ss_dassert(len+4 == GWBUF_LENGTH(scur->scmd_cur_cmd->my_sescmd_buf));
                         
-                        LOGIF(LE, (skygw_log_write_flush(
-                                LOGFILE_ERROR,
-                                "Error : Failed to execute %s in %s:%d. %s %s",
-                                cmdstr, 
-                                bref->bref_backend->backend_server->name,
-                                bref->bref_backend->backend_server->port,
-				err,
-				replystr)));
+                        MXS_ERROR("Failed to execute %s in %s:%d. %s %s",
+                                  cmdstr, 
+                                  bref->bref_backend->backend_server->name,
+                                  bref->bref_backend->backend_server->port,
+                                  err,
+                                  replystr);
                         
                         free(cmdstr);
 			free(err);
@@ -2980,22 +2918,18 @@ static void clientReply (
         {
 	    bool succp;
 
-                LOGIF(LT, (skygw_log_write(
-                        LOGFILE_TRACE,
-                        "Backend %s:%d processed reply and starts to execute "
-                        "active cursor.",
-                        bref->bref_backend->backend_server->name,
-                        bref->bref_backend->backend_server->port)));
+            MXS_INFO("Backend %s:%d processed reply and starts to execute "
+                     "active cursor.",
+                     bref->bref_backend->backend_server->name,
+                     bref->bref_backend->backend_server->port);
                 
                 succp = execute_sescmd_in_backend(bref);
 		ss_dassert(succp);
 		if(!succp)
 		{
-		    LOGIF(LT, (skygw_log_write(
-                        LOGFILE_TRACE,
-                        "Backend %s:%d failed to execute session command.",
-                        bref->bref_backend->backend_server->name,
-                        bref->bref_backend->backend_server->port)));
+		    MXS_INFO("Backend %s:%d failed to execute session command.",
+                             bref->bref_backend->backend_server->name,
+                             bref->bref_backend->backend_server->port);
 		}
         }
 	else if (bref->bref_pending_cmd != NULL) /*< non-sescmd is waiting to be routed */
@@ -3018,10 +2952,17 @@ static void clientReply (
 		}
 		else
 		{
-			LOGIF(LE, (skygw_log_write_flush(
-				LOGFILE_ERROR,
-				"Error : Routing query \"%s\" failed.",
-				bref->bref_pending_cmd)));
+                    char* sql = modutil_get_SQL(bref->bref_pending_cmd);
+
+                    if (sql)
+                    {
+			MXS_ERROR("Routing query \"%s\" failed.", sql);
+                        free(sql);
+                    }
+                    else
+                    {
+			MXS_ERROR("Failed to route query.");
+                    }
 		}
 		gwbuf_free(bref->bref_pending_cmd);
 		bref->bref_pending_cmd = NULL;
@@ -3090,7 +3031,7 @@ static void bref_clear_state(
 {
     if(bref == NULL)
     {
-	skygw_log_write(LE,"[%s] Error: NULL parameter.",__FUNCTION__);
+	MXS_ERROR("[%s] Error: NULL parameter.",__FUNCTION__);
 	return;
     }
         if (state != BREF_WAITING_RESULT)
@@ -3116,10 +3057,10 @@ static void bref_clear_state(
                         ss_dassert(prev2 > 0);
 			if(prev2 <= 0)
 			{
-			    skygw_log_write(LE,"[%s] Error: negative current operation count in backend %s:%u",
-				     __FUNCTION__,
-				     &bref->bref_backend->backend_server->name,
-				     &bref->bref_backend->backend_server->port);
+			    MXS_ERROR("[%s] Error: negative current operation count in backend %s:%u",
+                                      __FUNCTION__,
+                                      bref->bref_backend->backend_server->name,
+                                      bref->bref_backend->backend_server->port);
 			}
                 }       
         }
@@ -3131,7 +3072,7 @@ static void bref_set_state(
 {
     if(bref == NULL)
     {
-	skygw_log_write(LE,"[%s] Error: NULL parameter.",__FUNCTION__);
+	MXS_ERROR("[%s] Error: NULL parameter.",__FUNCTION__);
 	return;
     }
         if (state != BREF_WAITING_RESULT)
@@ -3148,10 +3089,11 @@ static void bref_set_state(
                 ss_dassert(prev1 >= 0);
                 if(prev1 < 0)
 		{
-		    skygw_log_write(LE,"[%s] Error: negative number of connections waiting for results in backend %s:%u",
-			     __FUNCTION__,
-			     &bref->bref_backend->backend_server->name,
-			     &bref->bref_backend->backend_server->port);
+		    MXS_ERROR("[%s] Error: negative number of connections waiting for "
+                              "results in backend %s:%u",
+                              __FUNCTION__,
+                              bref->bref_backend->backend_server->name,
+                              bref->bref_backend->backend_server->port);
 		}
                 /** Increase global operation count */
                 prev2 = atomic_add(
@@ -3159,10 +3101,10 @@ static void bref_set_state(
                 ss_dassert(prev2 >= 0);
 		if(prev2 < 0)
 		{
-		    skygw_log_write(LE,"[%s] Error: negative current operation count in backend %s:%u",
-			     __FUNCTION__,
-			     &bref->bref_backend->backend_server->name,
-			     &bref->bref_backend->backend_server->port);
+		    MXS_ERROR("[%s] Error: negative current operation count in backend %s:%u",
+                              __FUNCTION__,
+                              bref->bref_backend->backend_server->name,
+                              bref->bref_backend->backend_server->port);
 		}
         }
 }
@@ -3281,20 +3223,19 @@ static bool select_connect_backend_servers(
         }
 
 #if defined(EXTRA_SS_DEBUG)        
-        LOGIF(LT, (skygw_log_write(LOGFILE_TRACE, "Servers and conns before ordering:")));
+        MXS_INFO("Servers and conns before ordering:");
         
         for (i=0; i<router_nservers; i++)
         {
                 BACKEND* b = backend_ref[i].bref_backend;
 
-                LOGIF(LT, (skygw_log_write(LOGFILE_TRACE, 
-                                           "master bref %p bref %p %d %s %d:%d",
-                                           *p_master_ref,
-                                           &backend_ref[i],
-                                           backend_ref[i].bref_state,
-                                           b->backend_server->name,
-                                           b->backend_server->port,
-                                           b->backend_conn_count)));                
+                MXS_INFO("master bref %p bref %p %d %s %d:%d",
+                         *p_master_ref,
+                         &backend_ref[i],
+                         backend_ref[i].bref_state,
+                         b->backend_server->name,
+                         b->backend_server->port,
+                         b->backend_conn_count);
         }
 #endif
         /**
@@ -3304,17 +3245,16 @@ static bool select_connect_backend_servers(
          */
         qsort(backend_ref, (size_t)router_nservers, sizeof(backend_ref_t), p);
 
-        if (LOG_IS_ENABLED(LOGFILE_TRACE))
+        if (MXS_LOG_PRIORITY_IS_ENABLED(LOG_INFO))
         {
                 if (select_criteria == LEAST_GLOBAL_CONNECTIONS ||
                         select_criteria == LEAST_ROUTER_CONNECTIONS ||
                         select_criteria == LEAST_BEHIND_MASTER ||
                         select_criteria == LEAST_CURRENT_OPERATIONS)
                 {
-                        LOGIF(LT, (skygw_log_write(LOGFILE_TRACE, 
-                                "Servers and %s connection counts:",
-                                select_criteria == LEAST_GLOBAL_CONNECTIONS ? 
-                                "all MaxScale" : "router")));
+                        MXS_INFO("Servers and %s connection counts:",
+                                 select_criteria == LEAST_GLOBAL_CONNECTIONS ?
+                                 "all MaxScale" : "router");
 
                         for (i=0; i<router_nservers; i++)
                         {
@@ -3322,39 +3262,35 @@ static bool select_connect_backend_servers(
                                 
                                 switch(select_criteria) {
                                         case LEAST_GLOBAL_CONNECTIONS:
-                                                LOGIF(LT, (skygw_log_write_flush(LOGFILE_TRACE, 
-                                                        "MaxScale connections : %d in \t%s:%d %s",
-							b->backend_server->stats.n_current,
-							b->backend_server->name,
-							b->backend_server->port,
-							STRSRVSTATUS(b->backend_server))));
+                                                MXS_INFO("MaxScale connections : %d in \t%s:%d %s",
+                                                         b->backend_server->stats.n_current,
+                                                         b->backend_server->name,
+                                                         b->backend_server->port,
+                                                         STRSRVSTATUS(b->backend_server));
                                                 break;
                                         
                                         case LEAST_ROUTER_CONNECTIONS:
-                                                LOGIF(LT, (skygw_log_write_flush(LOGFILE_TRACE, 
-                                                        "RWSplit connections : %d in \t%s:%d %s",
-							b->backend_conn_count,
-							b->backend_server->name,
-							b->backend_server->port,
-							STRSRVSTATUS(b->backend_server))));
+                                            MXS_INFO("RWSplit connections : %d in \t%s:%d %s",
+                                                     b->backend_conn_count,
+                                                     b->backend_server->name,
+                                                     b->backend_server->port,
+                                                     STRSRVSTATUS(b->backend_server));
                                                 break;
                                                 
                                         case LEAST_CURRENT_OPERATIONS:
-                                                LOGIF(LT, (skygw_log_write_flush(LOGFILE_TRACE, 
-							"current operations : %d in \t%s:%d %s",
-							b->backend_server->stats.n_current_ops, 
-							b->backend_server->name,
-							b->backend_server->port,
-							STRSRVSTATUS(b->backend_server))));
+                                                MXS_INFO("current operations : %d in \t%s:%d %s",
+                                                         b->backend_server->stats.n_current_ops,
+                                                         b->backend_server->name,
+                                                         b->backend_server->port,
+                                                         STRSRVSTATUS(b->backend_server));
                                                 break;
                                                 
                                         case LEAST_BEHIND_MASTER:
-                                                LOGIF(LT, (skygw_log_write_flush(LOGFILE_TRACE, 
-							"replication lag : %d in \t%s:%d %s",
-							b->backend_server->rlag,
-							b->backend_server->name,
-							b->backend_server->port,
-							STRSRVSTATUS(b->backend_server))));
+                                                MXS_INFO("replication lag : %d in \t%s:%d %s",
+                                                         b->backend_server->rlag,
+                                                         b->backend_server->name,
+                                                         b->backend_server->port,
+                                                         STRSRVSTATUS(b->backend_server));
                                         default:
                                                 break;
                                 }
@@ -3445,12 +3381,10 @@ static bool select_connect_backend_servers(
                                         }
                                         else
                                         {
-                                                LOGIF(LE, (skygw_log_write_flush(
-                                                        LOGFILE_ERROR,
-                                                        "Error : Unable to establish "
-                                                        "connection with slave %s:%d",
-                                                        b->backend_server->name,
-                                                        b->backend_server->port)));
+                                            MXS_ERROR("Unable to establish "
+                                                      "connection with slave %s:%d",
+                                                      b->backend_server->name,
+                                                      b->backend_server->port);
                                                 /* handle connect error */
                                         }
                                 }
@@ -3500,12 +3434,10 @@ static bool select_connect_backend_servers(
                                 else
                                 {
                                         succp = false;
-                                        LOGIF(LE, (skygw_log_write_flush(
-                                                LOGFILE_ERROR,
-                                                "Error : Unable to establish "
-                                                "connection with master %s:%d",
-                                                b->backend_server->name,
-                                                b->backend_server->port)));
+                                        MXS_ERROR("Unable to establish "
+                                                  "connection with master %s:%d",
+                                                  b->backend_server->name,
+                                                  b->backend_server->port);
                                         /** handle connect error */
                                 }
                         }       
@@ -3513,20 +3445,19 @@ static bool select_connect_backend_servers(
         } /*< for */
         
 #if defined(EXTRA_SS_DEBUG)        
-        LOGIF(LT, (skygw_log_write(LOGFILE_TRACE, "Servers and conns after ordering:")));
+        MXS_INFO("Servers and conns after ordering:");
         
         for (i=0; i<router_nservers; i++)
         {
                 BACKEND* b = backend_ref[i].bref_backend;
                 
-                LOGIF(LT, (skygw_log_write_flush(LOGFILE_TRACE,
-                                                "master bref %p bref %p %d %s %d:%d",
-                                                *p_master_ref,
-                                                &backend_ref[i],
-                                                backend_ref[i].bref_state,
-                                                b->backend_server->name,
-                                                b->backend_server->port,
-                                                b->backend_conn_count)));                
+                MXS_INFO("master bref %p bref %p %d %s %d:%d",
+                         *p_master_ref,
+                         &backend_ref[i],
+                         backend_ref[i].bref_state,
+                         b->backend_server->name,
+                         b->backend_server->port,
+                         b->backend_conn_count);
         }
 	/* assert with master_host */
         ss_dassert(!master_connected ||
@@ -3546,51 +3477,31 @@ static bool select_connect_backend_servers(
                 if (slaves_connected == 0 && slaves_found > 0)
                 {
 #if defined(SS_EXTRA_DEBUG)
-                        LOGIF(LE, (skygw_log_write(
-                                LOGFILE_ERROR,
-                                "Warning : Couldn't connect to any of the %d "
+                    MXS_WARNING("Couldn't connect to any of the %d "
                                 "slaves. Routing to %s only.",
                                 slaves_found,
-                                (is_synced_master ? "Galera nodes" : "Master"))));
-                        
-                        LOGIF(LM, (skygw_log_write(
-                                LOGFILE_MESSAGE,
-                                "* Warning : Couldn't connect to any of the %d "
-                                "slaves. Routing to %s only.",
-                                slaves_found,
-                                (is_synced_master ? "Galera nodes" : "Master"))));
+                                (is_synced_master ? "Galera nodes" : "Master"));
 #endif
                 }
                 else if (slaves_found == 0)
                 {
 #if defined(SS_EXTRA_DEBUG)
-                        LOGIF(LE, (skygw_log_write(
-                                LOGFILE_ERROR,
-                                "Warning : Couldn't find any slaves from existing "
+                    MXS_WARNING("Couldn't find any slaves from existing "
                                 "%d servers. Routing to %s only.",
                                 router_nservers,
-                                (is_synced_master ? "Galera nodes" : "Master"))));
-                        
-                        LOGIF(LM, (skygw_log_write(
-                                LOGFILE_MESSAGE,
-                                "* Warning : Couldn't find any slaves from existing "
-                                "%d servers. Routing to %s only.",
-                                router_nservers,
-                                (is_synced_master ? "Galera nodes" : "Master"))));                        
+                                (is_synced_master ? "Galera nodes" : "Master"));
 #endif
                 }
                 else if (slaves_connected < max_nslaves)
                 {
-                        LOGIF(LT, (skygw_log_write_flush(
-                                LOGFILE_TRACE,
-                                "Note : Couldn't connect to maximum number of "
-                                "slaves. Connected successfully to %d slaves "
-                                "of %d of them.",
-                                slaves_connected,
-                                slaves_found)));
+                    MXS_INFO("Couldn't connect to maximum number of "
+                             "slaves. Connected successfully to %d slaves "
+                             "of %d of them.",
+                             slaves_connected,
+                             slaves_found);
                 }
                 
-                if (LOG_IS_ENABLED(LT))
+                if (MXS_LOG_PRIORITY_IS_ENABLED(LOG_INFO))
                 {
                         for (i=0; i<router_nservers; i++)
                         {
@@ -3598,12 +3509,10 @@ static bool select_connect_backend_servers(
 
                                 if (BREF_IS_IN_USE((&backend_ref[i])))
                                 {                                        
-                                        LOGIF(LT, (skygw_log_write(
-                                                LOGFILE_TRACE,
-                                                "Selected %s in \t%s:%d",
-                                                STRSRVSTATUS(b->backend_server),
-                                                b->backend_server->name,
-                                                b->backend_server->port)));
+                                    MXS_INFO("Selected %s in \t%s:%d",
+                                             STRSRVSTATUS(b->backend_server),
+                                             b->backend_server->name,
+                                             b->backend_server->port);
                                 }
                         } /* for */
                 }
@@ -3617,65 +3526,24 @@ static bool select_connect_backend_servers(
                 
                 if (!master_found)
                 {
-                        LOGIF(LE, (skygw_log_write(
-                                LOGFILE_ERROR,
-                                "Error : Couldn't find suitable %s from %d "
-                                "candidates.",
-                                (is_synced_master ? "Galera node" : "Master"),
-                                router_nservers)));
-                        
-                        LOGIF(LM, (skygw_log_write(
-                                LOGFILE_MESSAGE,
-                                "Error : Couldn't find suitable %s from %d "
-                                "candidates.",
-                                (is_synced_master ? "Galera node" : "Master"),
-                                router_nservers)));
- 
-                        LOGIF(LT, (skygw_log_write(
-                                LOGFILE_TRACE,
-                                "Error : Couldn't find suitable %s from %d "
-                                "candidates.",
-                                (is_synced_master ? "Galera node" : "Master"),
-                                router_nservers)));
+                    MXS_ERROR("Couldn't find suitable %s from %d "
+                              "candidates.",
+                              (is_synced_master ? "Galera node" : "Master"),
+                              router_nservers);
                 }
                 else if (!master_connected)
                 {
-                        LOGIF(LE, (skygw_log_write(
-                                LOGFILE_ERROR,
-                                "Error : Couldn't connect to any %s although "
-                                "there exists at least one %s node in the "
-                                "cluster.",
-                                (is_synced_master ? "Galera node" : "Master"),
-                                (is_synced_master ? "Galera node" : "Master"))));
-                        
-                        LOGIF(LM, (skygw_log_write(
-                                LOGFILE_MESSAGE,
-                                "Error : Couldn't connect to any %s although "
-                                "there exists at least one %s node in the "
-                                "cluster.",
-                                (is_synced_master ? "Galera node" : "Master"),
-                                (is_synced_master ? "Galera node" : "Master"))));
-
-                        LOGIF(LT, (skygw_log_write(
-                                LOGFILE_TRACE,
-                                "Error : Couldn't connect to any %s although "
-                                "there exists at least one %s node in the "
-                                "cluster.",
-                                (is_synced_master ? "Galera node" : "Master"),
-                                (is_synced_master ? "Galera node" : "Master"))));
+                    MXS_ERROR("Couldn't connect to any %s although "
+                              "there exists at least one %s node in the "
+                              "cluster.",
+                              (is_synced_master ? "Galera node" : "Master"),
+                              (is_synced_master ? "Galera node" : "Master"));
                 }
 
                 if (slaves_connected < min_nslaves)
                 {
-                        LOGIF(LE, (skygw_log_write(
-                                LOGFILE_ERROR,
-                                "Error : Couldn't establish required amount of "
-                                "slave connections for router session.")));
-                        
-                        LOGIF(LM, (skygw_log_write(
-                                LOGFILE_MESSAGE,
-                                "Error : Couldn't establish required amount of "
-                                "slave connections for router session.")));
+                    MXS_ERROR("Couldn't establish required amount of "
+                              "slave connections for router session.");
                 }
                 
                 /** Clean up connections */
@@ -3686,10 +3554,10 @@ static bool select_connect_backend_servers(
                                 ss_dassert(backend_ref[i].bref_backend->backend_conn_count > 0);
                                 
                                 /** disconnect opened connections */
-                                dcb_close(backend_ref[i].bref_dcb);
                                 bref_clear_state(&backend_ref[i], BREF_IN_USE);
                                 /** Decrease backend's connection counter. */
                                 atomic_add(&backend_ref[i].bref_backend->backend_conn_count, -1);
+                                dcb_close(backend_ref[i].bref_dcb);
                         }
                 }
         }
@@ -3710,7 +3578,7 @@ static rses_property_t* rses_property_init(
 	prop = (rses_property_t*)calloc(1, sizeof(rses_property_t));
 	if (prop == NULL)
 	{
-	    skygw_log_write(LE,"Error: Malloc returned NULL. (%s:%d)",__FILE__,__LINE__);
+	    MXS_ERROR("Error: Malloc returned NULL. (%s:%d)",__FILE__,__LINE__);
 	    return NULL;
 	}
 	prop->rses_prop_type = prop_type;
@@ -3731,7 +3599,7 @@ static void rses_property_done(
 {
     if(prop == NULL)
     {
-	skygw_log_write(LE,"[%s] Error: NULL parameter.",__FUNCTION__);
+	MXS_ERROR("[%s] Error: NULL parameter.",__FUNCTION__);
 	return;
     }
 	CHK_RSES_PROP(prop);
@@ -3746,13 +3614,11 @@ static void rses_property_done(
 		break;
 		
 	default:
-		LOGIF(LD, (skygw_log_write(
-                                   LOGFILE_DEBUG,
-                                   "%lu [rses_property_done] Unknown property type %d "
-                                   "in property %p",
-                                   pthread_self(),
-                                   prop->rses_prop_type,
-                                   prop)));
+                MXS_DEBUG("%lu [rses_property_done] Unknown property type %d "
+                          "in property %p",
+                          pthread_self(),
+                          prop->rses_prop_type,
+                          prop);
 		
 		ss_dassert(false);
 		break;
@@ -3773,12 +3639,12 @@ static int rses_property_add(
 {
     if(rses == NULL)
     {
-	skygw_log_write(LE,"Error: Router client session is NULL. (%s:%d)",__FILE__,__LINE__);
+	MXS_ERROR("Router client session is NULL. (%s:%d)",__FILE__,__LINE__);
 	return -1;
     }
     if(prop == NULL)
     {
-	skygw_log_write(LE,"Error: Router client session property is NULL. (%s:%d)",__FILE__,__LINE__);
+	MXS_ERROR("Router client session property is NULL. (%s:%d)",__FILE__,__LINE__);
 	return -1;
     }
         rses_property_t* p;
@@ -3816,7 +3682,7 @@ static mysql_sescmd_t* rses_property_get_sescmd(
 
 	if(prop == NULL)
 	{
-	skygw_log_write(LE,"[%s] Error: NULL parameter.",__FUNCTION__);
+            MXS_ERROR("[%s] Error: NULL parameter.",__FUNCTION__);
 	    return NULL;
 	}
 
@@ -3866,7 +3732,7 @@ static void mysql_sescmd_done(
 {
     if(sescmd == NULL)
     {
-	skygw_log_write(LE,"[%s] Error: NULL parameter.",__FUNCTION__);
+	MXS_ERROR("[%s] Error: NULL parameter.",__FUNCTION__);
 	return;
     }
 	CHK_RSES_PROP(sescmd->my_sescmd_prop);
@@ -3938,10 +3804,9 @@ static GWBUF* sescmd_cursor_process_replies(
 			
 			if(bref->reply_cmd != scmd->reply_cmd)
 			{
-			    skygw_log_write(LOGFILE_TRACE,"Backend "
-				    "server '%s' response differs from master's response. "
-				    "Closing connection.",
-                                    bref->bref_backend->backend_server->unique_name);
+			    MXS_INFO("Backend server '%s' response differs from master's response. "
+                                     "Closing connection.",
+                                     bref->bref_backend->backend_server->unique_name);
 			    sescmd_cursor_set_active(scur,false);
 			     bref_clear_state(bref,BREF_QUERY_ACTIVE);
 			     bref_clear_state(bref,BREF_IN_USE);
@@ -3964,8 +3829,8 @@ static GWBUF* sescmd_cursor_process_replies(
                         /** Mark the rest session commands as replied */
                         scmd->my_sescmd_is_replied = true;
                         scmd->reply_cmd = *((unsigned char*)replybuf->start + 4);
-			skygw_log_write(LT,"Master '%s' responded to a session command.",
-			     bref->bref_backend->backend_server->unique_name);
+			MXS_INFO("Master '%s' responded to a session command.",
+                                 bref->bref_backend->backend_server->unique_name);
 			int i;
 			
 			for(i=0;i<ses->rses_nbackends;i++)
@@ -3984,8 +3849,9 @@ static GWBUF* sescmd_cursor_process_replies(
 				    if(ses->rses_backend_ref[i].bref_dcb)
 					dcb_close(ses->rses_backend_ref[i].bref_dcb);
 				    *reconnect = true;
-				    skygw_log_write(LT,"Disabling slave %s:%d, result differs from master's result. Master: %d Slave: %d",
-					    ses->rses_backend_ref[i].bref_backend->backend_server->name,
+				    MXS_INFO("Disabling slave %s:%d, result differs from "
+                                             "master's result. Master: %d Slave: %d",
+                                             ses->rses_backend_ref[i].bref_backend->backend_server->name,
 					     ses->rses_backend_ref[i].bref_backend->backend_server->port,
 					     bref->reply_cmd,
 					     ses->rses_backend_ref[i].reply_cmd);
@@ -3996,14 +3862,14 @@ static GWBUF* sescmd_cursor_process_replies(
                 }
 		else
 		{
-		    skygw_log_write(LT,"Slave '%s' responded before master to a session command. Result: %d",
+		    MXS_INFO("Slave '%s' responded before master to a session command. Result: %d",
 			     bref->bref_backend->backend_server->unique_name,
 			     (int)bref->reply_cmd);
 		    if(bref->reply_cmd == 0xff)
 		    {
 			SERVER* serv = bref->bref_backend->backend_server;
-			skygw_log_write(LE,"Error: Slave '%s' (%s:%u) failed to execute session command.",
-				 serv->unique_name,serv->name,serv->port);
+			MXS_ERROR("Slave '%s' (%s:%u) failed to execute session command.",
+                                  serv->unique_name,serv->name,serv->port);
 		    }
 		    if(replybuf)
 			while((replybuf = gwbuf_consume(replybuf,gwbuf_length(replybuf))));
@@ -4055,7 +3921,7 @@ static bool sescmd_cursor_is_active(
 
 	if(sescmd_cursor == NULL)
 	{
-	skygw_log_write(LE,"[%s] Error: NULL parameter.",__FUNCTION__);
+            MXS_ERROR("[%s] Error: NULL parameter.",__FUNCTION__);
 	    return false;
 	}
         ss_dassert(SPINLOCK_IS_LOCKED(&sescmd_cursor->scmd_cur_rses->rses_lock));
@@ -4085,7 +3951,7 @@ static GWBUF* sescmd_cursor_clone_querybuf(
 	GWBUF* buf;
 	if(scur == NULL)
 	{
-	skygw_log_write(LE,"[%s] Error: NULL parameter.",__FUNCTION__);
+            MXS_ERROR("[%s] Error: NULL parameter.",__FUNCTION__);
 	    return NULL;
 	}
 	ss_dassert(scur->scmd_cur_cmd != NULL);
@@ -4103,7 +3969,7 @@ static bool sescmd_cursor_history_empty(
 
         if(scur == NULL)
 	{
-	skygw_log_write(LE,"[%s] Error: NULL parameter.",__FUNCTION__);
+            MXS_ERROR("[%s] Error: NULL parameter.",__FUNCTION__);
 	    return true;
 	}
         CHK_SESCMD_CUR(scur);
@@ -4127,7 +3993,7 @@ static void sescmd_cursor_reset(
         ROUTER_CLIENT_SES* rses;
 	if(scur == NULL)
 	{
-	skygw_log_write(LE,"[%s] Error: NULL parameter.",__FUNCTION__);
+            MXS_ERROR("[%s] Error: NULL parameter.",__FUNCTION__);
 	    return;
 	}
         CHK_SESCMD_CUR(scur);
@@ -4148,7 +4014,7 @@ static bool execute_sescmd_history(
         sescmd_cursor_t* scur;
 	if(bref == NULL)
 	{
-	skygw_log_write(LE,"[%s] Error: NULL parameter.",__FUNCTION__);
+            MXS_ERROR("[%s] Error: NULL parameter.",__FUNCTION__);
 	    return false;
 	}
         CHK_BACKEND_REF(bref);
@@ -4189,7 +4055,7 @@ static bool execute_sescmd_in_backend(
 	GWBUF* buf;
 	if(backend_ref == NULL)
 	{
-	skygw_log_write(LE,"[%s] Error: NULL parameter.",__FUNCTION__);
+            MXS_ERROR("[%s] Error: NULL parameter.",__FUNCTION__);
 	    return false;
 	}
         if (BREF_IS_CLOSED(backend_ref))
@@ -4211,9 +4077,7 @@ static bool execute_sescmd_in_backend(
 	if (sescmd_cursor_get_command(scur) == NULL)
 	{
 		succp = false;
-                LOGIF(LT, (skygw_log_write_flush(
-                        LOGFILE_TRACE,
-                        "Cursor had no pending session commands.")));
+                MXS_INFO("Cursor had no pending session commands.");
                 
                 goto return_succp;
 	}
@@ -4297,7 +4161,7 @@ static bool sescmd_cursor_next(
 
 	if(scur == NULL)
 	{
-	skygw_log_write(LE,"[%s] Error: NULL parameter.",__FUNCTION__);
+            MXS_ERROR("[%s] Error: NULL parameter.",__FUNCTION__);
 	    return false;
 	}
 
@@ -4399,17 +4263,15 @@ static void tracelog_routed_query(
                         querystr = (char *)malloc(len);
                         memcpy(querystr, startpos, len-1);
                         querystr[len-1] = '\0';
-                        LOGIF(LD, (skygw_log_write_flush(
-                                LOGFILE_DEBUG,
-                                "%lu [%s] %d bytes long buf, \"%s\" -> %s:%d %s dcb %p",
-                                pthread_self(),
-                                funcname,
-                                buflen,
-                                querystr,
-                                b->backend_server->name,
-                                b->backend_server->port, 
-                                STRBETYPE(be_type),
-                                dcb)));
+                        MXS_DEBUG("%lu [%s] %d bytes long buf, \"%s\" -> %s:%d %s dcb %p",
+                                  pthread_self(),
+                                  funcname,
+                                  (int)buflen,
+                                  querystr,
+                                  b->backend_server->name,
+                                  b->backend_server->port, 
+                                  STRBETYPE(be_type),
+                                  dcb);
                         free(querystr);
                 }
                 else if (packet_type == '\x22' || 
@@ -4421,18 +4283,16 @@ static void tracelog_routed_query(
                         querystr = (char *)malloc(len);
                         memcpy(querystr, startpos, len-1);
                         querystr[len-1] = '\0';
-                        LOGIF(LD, (skygw_log_write_flush(
-                                LOGFILE_DEBUG,
-                                "%lu [%s] %d bytes long buf, \"%s\" -> %s:%d %s dcb %p",
-                                pthread_self(),
-                                funcname,
-                                buflen,
-                                querystr,
-                                b->backend_server->name,
-                                b->backend_server->port, 
-                                STRBETYPE(be_type),
-                                dcb)));
-                        free(querystr);                        
+                        MXS_DEBUG("%lu [%s] %d bytes long buf, \"%s\" -> %s:%d %s dcb %p",
+                                  pthread_self(),
+                                  funcname,
+                                  (int)buflen,
+                                  querystr,
+                                  b->backend_server->name,
+                                  b->backend_server->port,
+                                  STRBETYPE(be_type),
+                                  dcb);
+                        free(querystr);
                 }
         }
         gwbuf_free(buf);
@@ -4440,27 +4300,11 @@ static void tracelog_routed_query(
 
 
 /**
- * Return rc, rc < 0 if router session is closed. rc == 0 if there are no 
- * capabilities specified, rc > 0 when there are capabilities.
+ * Return RCAP_TYPE_STMT_INPUT.
  */ 
-static uint8_t getCapabilities (
-        ROUTER* inst,
-        void*   router_session)
+static int getCapabilities ()
 {
-        ROUTER_CLIENT_SES* rses = (ROUTER_CLIENT_SES *)router_session;
-        uint8_t            rc;
-        
-        if (!rses_begin_locked_router_action(rses))
-        {
-                rc = 0xff;
-                goto return_rc;
-        }
-        rc = rses->rses_capabilities;
-        
-        rses_end_locked_router_action(rses);
-        
-return_rc:
-        return rc;
+        return RCAP_TYPE_STMT_INPUT;
 }
 
 /**
@@ -4498,9 +4342,7 @@ static bool route_session_write(
 	int               nbackends;
 	int 		  nsucc;
   
-        LOGIF(LT, (skygw_log_write(
-                LOGFILE_TRACE,
-                "Session write, routing to all servers.")));
+        MXS_INFO("Session write, routing to all servers.");
 	/** Maximum number of slaves in this router client session */
 	max_nslaves = rses_get_max_slavecount(router_cli_ses, 
 					  router_cli_ses->rses_nbackends);
@@ -4530,16 +4372,15 @@ static bool route_session_write(
                 {
                         DCB* dcb = backend_ref[i].bref_dcb;     
 			
-			if (LOG_IS_ENABLED(LOGFILE_TRACE) && BREF_IS_IN_USE((&backend_ref[i])))
+			if (MXS_LOG_PRIORITY_IS_ENABLED(LOG_INFO) &&
+                            BREF_IS_IN_USE((&backend_ref[i])))
 			{
-				LOGIF(LT, (skygw_log_write(
-					LOGFILE_TRACE,
-					"Route query to %s \t%s:%d%s",
-					(SERVER_IS_MASTER(backend_ref[i].bref_backend->backend_server) ? 
-						"master" : "slave"),
-					backend_ref[i].bref_backend->backend_server->name,
-					backend_ref[i].bref_backend->backend_server->port,
-					(i+1==router_cli_ses->rses_nbackends ? " <" : " "))));
+                            MXS_INFO("Route query to %s \t%s:%d%s",
+                                     (SERVER_IS_MASTER(backend_ref[i].bref_backend->backend_server) ?
+                                      "master" : "slave"),
+                                     backend_ref[i].bref_backend->backend_server->name,
+                                     backend_ref[i].bref_backend->backend_server->port,
+                                     (i+1==router_cli_ses->rses_nbackends ? " <" : " "));
 			}
 
                         if (BREF_IS_IN_USE((&backend_ref[i])))
@@ -4563,10 +4404,8 @@ static bool route_session_write(
         
         if (router_cli_ses->rses_nbackends <= 0)
 	{
-		LOGIF(LT, (skygw_log_write(
-			LOGFILE_TRACE,
-			"Router session doesn't have any backends in use. "
-			"Routing failed. <")));
+            MXS_INFO("Router session doesn't have any backends in use. "
+                     "Routing failed. <");
 		
 		goto return_succp;
 	}
@@ -4574,9 +4413,10 @@ static bool route_session_write(
         if (router_cli_ses->rses_config.rw_max_sescmd_history_size > 0 &&
             router_cli_ses->rses_nsescmd >= router_cli_ses->rses_config.rw_max_sescmd_history_size)
     {
-        skygw_log_write(LM, "Warning: Router session exceeded session command history limit. "
-                        "Slave recovery is disabled and only slave servers with consistent session state are used "
-                        "for the duration of the session.");
+        MXS_WARNING("Router session exceeded session command history limit. "
+                    "Slave recovery is disabled and only slave servers with "
+                    "consistent session state are used "
+                    "for the duration of the session.");
         router_cli_ses->rses_config.rw_disable_sescmd_hist = true;
         router_cli_ses->rses_config.rw_max_sescmd_history_size = 0;
     }
@@ -4625,7 +4465,7 @@ static bool route_session_write(
          */
         if((prop = rses_property_init(RSES_PROP_TYPE_SESCMD)) == NULL)
 	{
-	    skygw_log_write(LE,"Error: Router session property initialization failed");
+	    MXS_ERROR("Router session property initialization failed");
 	    rses_end_locked_router_action(router_cli_ses);
 	    return false;
 	}
@@ -4634,7 +4474,7 @@ static bool route_session_write(
         /** Add sescmd property to router client session */
         if(rses_property_add(router_cli_ses, prop) != 0)
 	{
-	    skygw_log_write(LE,"Error: Session property addition failed.");
+	    MXS_ERROR("Session property addition failed.");
 	    rses_end_locked_router_action(router_cli_ses);
 	    return false;
 	}
@@ -4647,16 +4487,14 @@ static bool route_session_write(
                         
 			nbackends += 1;
 			
-			if (LOG_IS_ENABLED(LOGFILE_TRACE))
+			if (MXS_LOG_PRIORITY_IS_ENABLED(LOG_INFO))
 			{
-				LOGIF(LT, (skygw_log_write(
-					LOGFILE_TRACE,
-					"Route query to %s \t%s:%d%s",
-					(SERVER_IS_MASTER(backend_ref[i].bref_backend->backend_server) ? 
-					"master" : "slave"),
-					backend_ref[i].bref_backend->backend_server->name,
-					backend_ref[i].bref_backend->backend_server->port,
-					(i+1==router_cli_ses->rses_nbackends ? " <" : " "))));
+                            MXS_INFO("Route query to %s \t%s:%d%s",
+                                     (SERVER_IS_MASTER(backend_ref[i].bref_backend->backend_server) ?
+                                      "master" : "slave"),
+                                     backend_ref[i].bref_backend->backend_server->name,
+                                     backend_ref[i].bref_backend->backend_server->port,
+                                     (i+1==router_cli_ses->rses_nbackends ? " <" : " "));
 			}
 			
                         scur = backend_ref_get_sescmd_cursor(&backend_ref[i]);
@@ -4675,11 +4513,9 @@ static bool route_session_write(
                         if (sescmd_cursor_is_active(scur))
                         {
 				nsucc += 1;
-                                LOGIF(LT, (skygw_log_write(
-                                        LOGFILE_TRACE,
-                                        "Backend %s:%d already executing sescmd.",
-                                        backend_ref[i].bref_backend->backend_server->name,
-                                        backend_ref[i].bref_backend->backend_server->port)));
+                                MXS_INFO("Backend %s:%d already executing sescmd.",
+                                         backend_ref[i].bref_backend->backend_server->name,
+                                         backend_ref[i].bref_backend->backend_server->port);
                         }
                         else
                         {
@@ -4689,12 +4525,10 @@ static bool route_session_write(
 				}
 				else
 				{
-                                        LOGIF(LE, (skygw_log_write_flush(
-                                                LOGFILE_ERROR,
-                                                "Error : Failed to execute session "
-                                                "command in %s:%d",
-                                                backend_ref[i].bref_backend->backend_server->name,
-                                                backend_ref[i].bref_backend->backend_server->port)));
+                                    MXS_ERROR("Failed to execute session "
+                                              "command in %s:%d",
+                                              backend_ref[i].bref_backend->backend_server->name,
+                                              backend_ref[i].bref_backend->backend_server->port);
                                 }
                         }
                 }
@@ -4768,11 +4602,9 @@ static void rwsplit_process_router_options(
         {
                 if ((value = strchr(options[i], '=')) == NULL)
                 {
-                        LOGIF(LE, (skygw_log_write(
-                                LOGFILE_ERROR, "Warning : Unsupported "
-                                "router option \"%s\" for "
-                                "readwritesplit router.",
-                                options[i])));
+                    MXS_ERROR("Unsupported router option \"%s\" for "
+                              "readwritesplit router.",
+                              options[i]);
                 }
                 else
                 {
@@ -4790,14 +4622,13 @@ static void rwsplit_process_router_options(
                                
                                 if (c == UNDEFINED_CRITERIA)
                                 {
-                                        LOGIF(LE, (skygw_log_write(
-                                                LOGFILE_ERROR, "Warning : Unknown "
+                                    MXS_WARNING("Unknown "
                                                 "slave selection criteria \"%s\". "
                                                 "Allowed values are LEAST_GLOBAL_CONNECTIONS, "
                                                 "LEAST_ROUTER_CONNECTIONS, "
                                                 "LEAST_BEHIND_MASTER,"
                                                 "and LEAST_CURRENT_OPERATIONS.",
-                                                STRCRITERIA(router->rwsplit_config.rw_slave_select_criteria))));
+                                                STRCRITERIA(router->rwsplit_config.rw_slave_select_criteria));
                                 }
                                 else
                                 {
@@ -4822,17 +4653,16 @@ static void rwsplit_process_router_options(
 
 /**
  * Error Handler routine to resolve _backend_ failures. If it succeeds then there
- * are enough operative backends available and connected. Otherwise it fails, 
+ * are enough operative backends available and connected. Otherwise it fails,
  * and session is terminated.
  *
  * @param       instance        The router instance
  * @param       router_session  The router session
  * @param       errmsgbuf       The error message to reply
  * @param       backend_dcb     The backend DCB
- * @param       action          The action: REPLY, REPLY_AND_CLOSE, NEW_CONNECTION
- * @param       succp           Result of action. True if there is at least master 
- * and enough slaves to continue session. Otherwise false.
- * 
+ * @param       action     	The action: ERRACT_NEW_CONNECTION or ERRACT_REPLY_CLIENT
+ * @param	succp		Result of action: true iff router can continue
+ *
  * Even if succp == true connecting to new slave may have failed. succp is to
  * tell whether router has enough master/slave connections to continue work.
  */
@@ -4840,7 +4670,7 @@ static void handleError (
         ROUTER*        instance,
         void*          router_session,
         GWBUF*         errmsgbuf,
-        DCB*           backend_dcb,
+        DCB*           problem_dcb,
         error_action_t action,
         bool*          succp)
 {
@@ -4848,64 +4678,81 @@ static void handleError (
         ROUTER_INSTANCE*   inst    = (ROUTER_INSTANCE *)instance;
         ROUTER_CLIENT_SES* rses    = (ROUTER_CLIENT_SES *)router_session;
 
-        CHK_DCB(backend_dcb);
+        CHK_DCB(problem_dcb);
 
-	/** Reset error handle flag from a given DCB */
-	if (action == ERRACT_RESET)
-	{
-		backend_dcb->dcb_errhandle_called = false;
-		return;
-	}
-	
 	/** Don't handle same error twice on same DCB */
-	if (backend_dcb->dcb_errhandle_called)
+	if (problem_dcb->dcb_errhandle_called)
 	{
-		/** we optimistically assume that previous call succeed */
+            /** we optimistically assume that previous call succeed */
+            /*
+             * The return of true is potentially misleading, but appears to
+             * be safe with the code as it stands on 9 Sept 2015 - MNB
+             */
 		*succp = true;
 		return;
 	}
 	else
 	{
-		backend_dcb->dcb_errhandle_called = true;
+		problem_dcb->dcb_errhandle_called = true;
 	}
-        session = backend_dcb->session;
-        
+        session = problem_dcb->session;
+
         if (session == NULL || rses == NULL)
 	{
                 *succp = false;
-		return;
-	}
-	CHK_SESSION(session);
-	CHK_CLIENT_RSES(rses);
-        
-        switch (action) {
+    }
+    else if (dcb_isclient(problem_dcb))
+    {
+        *succp = false;
+    }
+        else
+        {
+            CHK_SESSION(session);
+            CHK_CLIENT_RSES(rses);
+
+            switch (action) {
                 case ERRACT_NEW_CONNECTION:
                 {
 			SERVER* srv;
-			
+
 			if (!rses_begin_locked_router_action(rses))
 			{
 				*succp = false;
-				return;
+				break;
 			}
 			srv = rses->rses_master_ref->bref_backend->backend_server;
 			/**
-			 * If master has lost its Master status error can't be 
+			 * If master has lost its Master status error can't be
 			 * handled so that session could continue.
 			 */
-                        if (rses->rses_master_ref->bref_dcb == backend_dcb &&
+                        if (rses->rses_master_ref->bref_dcb == problem_dcb &&
 				!SERVER_IS_MASTER(srv))
 			{
+                        	backend_ref_t*  bref;
+                            bref = get_bref_from_dcb(rses, problem_dcb);
+                        	if (bref != NULL)
+                            {
+                                    CHK_BACKEND_REF(bref);
+                                    bref_clear_state(bref, BREF_IN_USE);
+                                    bref_set_state(bref, BREF_CLOSED);
+                            }
+                            else
+                            {
+                                MXS_ERROR("server %s:%d lost the "
+                                          "master status but could not locate the "
+                                          "corresponding backend ref.",
+                                          srv->name,
+                                          srv->port);
+                                dcb_close(problem_dcb);
+                            }
 				if (!srv->master_err_is_logged)
 				{
-					LOGIF(LE, (skygw_log_write_flush(
-						LOGFILE_ERROR,
-						"Error : server %s:%d lost the "
-						"master status. Readwritesplit "
-						"service can't locate the master. "
-						"Client sessions will be closed.",
-						srv->name,
-						srv->port)));	
+                                    MXS_ERROR("server %s:%d lost the "
+                                              "master status. Readwritesplit "
+                                              "service can't locate the master. "
+                                              "Client sessions will be closed.",
+                                              srv->name,
+                                              srv->port);
 					srv->master_err_is_logged = true;
 				}
 				*succp = false;
@@ -4913,33 +4760,35 @@ static void handleError (
 			else
 			{
 				/**
-				* This is called in hope of getting replacement for 
+				* This is called in hope of getting replacement for
 				* failed slave(s).  This call may free rses.
 				*/
-				*succp = handle_error_new_connection(inst, 
-								&rses, 
-								backend_dcb, 
+				*succp = handle_error_new_connection(inst,
+								&rses,
+								problem_dcb,
 								errmsgbuf);
 			}
                         /* Free the lock if rses still exists */
                         if (rses) rses_end_locked_router_action(rses);
                         break;
                 }
-                
+
                 case ERRACT_REPLY_CLIENT:
                 {
-                        handle_error_reply_client(session, 
-						  rses, 
-						  backend_dcb, 
+                        handle_error_reply_client(session,
+						  rses,
+						  problem_dcb,
 						  errmsgbuf);
 			*succp = false; /*< no new backend servers were made available */
-                        break;       
+                        break;
                 }
-                
-		default:                        
+
+		default:
                         *succp = false;
                         break;
+            }
         }
+        dcb_close(problem_dcb);
 }
 
 
@@ -4952,7 +4801,7 @@ static void handle_error_reply_client(
 	session_state_t sesstate;
 	DCB*            client_dcb;
 	backend_ref_t*  bref;
-	
+
 	spinlock_acquire(&ses->ses_lock);
 	sesstate = ses->state;
 	client_dcb = ses->client;
@@ -4967,7 +4816,7 @@ static void handle_error_reply_client(
 		bref_clear_state(bref, BREF_IN_USE);
 		bref_set_state(bref, BREF_CLOSED);
 	}
-	
+
 	if (sesstate == SESSION_STATE_ROUTER_READY)
 	{
 		CHK_DCB(client_dcb);
@@ -4995,7 +4844,7 @@ static bool handle_error_new_connection(
 	DCB*               backend_dcb,
 	GWBUF*             errmsg)
 {
-        ROUTER_CLIENT_SES*  myrses;
+    ROUTER_CLIENT_SES*  myrses;
 	SESSION*       ses;
 	int            router_nservers;
 	int            max_nslaves;
@@ -5003,7 +4852,7 @@ static bool handle_error_new_connection(
 	backend_ref_t* bref;
 	bool           succp;
 	
-        myrses = *rses;
+    myrses = *rses;
 	ss_dassert(SPINLOCK_IS_LOCKED(&myrses->rses_lock));
 	
 	ses = backend_dcb->session;
@@ -5053,7 +4902,6 @@ static bool handle_error_new_connection(
 			DCB_REASON_NOT_RESPONDING, 
 			&router_handle_state_switch, 
 			(void *)bref);
-	
 	router_nservers = router_get_servercount(inst);
 	max_nslaves     = rses_get_max_slavecount(myrses, router_nservers);
 	max_slave_rlag  = rses_get_max_replication_lag(myrses);
@@ -5118,13 +4966,11 @@ static void print_error_packet(
                                 char* str = (char*)&ptr[7]; 
                                 bufstr = strndup(str, len-3);
                                 
-                                LOGIF(LE, (skygw_log_write_flush(
-                                        LOGFILE_ERROR,
-                                        "Error : Backend server %s:%d responded with "
-                                        "error : %s",
-                                        srv->name,
-                                        srv->port,
-                                        bufstr)));                
+                                MXS_ERROR("Backend server %s:%d responded with "
+                                          "error : %s",
+                                          srv->name,
+                                          srv->port,
+                                          bufstr);
                                 free(bufstr);
                         }
                         buf = gwbuf_consume(buf, len+4);
@@ -5164,14 +5010,12 @@ static bool have_enough_servers(
         {
                 if (router_nsrv < min_nsrv)
                 {
-                        LOGIF(LE, (skygw_log_write_flush(
-                                LOGFILE_ERROR,
-                                "Error : Unable to start %s service. There are "
-                                "too few backend servers available. Found %d "
-                                "when %d is required.",
-                                router->service->name,
-                                router_nsrv,
-                                min_nsrv)));
+                    MXS_ERROR("Unable to start %s service. There are "
+                              "too few backend servers available. Found %d "
+                              "when %d is required.",
+                              router->service->name,
+                              router_nsrv,
+                              min_nsrv);
                 }
                 else
                 {
@@ -5180,27 +5024,23 @@ static bool have_enough_servers(
                         
                         if ((*p_rses)->rses_config.rw_max_slave_conn_count < min_nsrv)
                         {
-                                LOGIF(LE, (skygw_log_write_flush(
-                                        LOGFILE_ERROR,
-                                        "Error : Unable to start %s service. There are "
-                                        "too few backend servers configured in "
-                                        "MaxScale.cnf. Found %d when %d is required.",
-                                        router->service->name,
-                                        (*p_rses)->rses_config.rw_max_slave_conn_count,
-                                        min_nsrv)));
+                            MXS_ERROR("Unable to start %s service. There are "
+                                      "too few backend servers configured in "
+                                      "MaxScale.cnf. Found %d when %d is required.",
+                                      router->service->name,
+                                      (*p_rses)->rses_config.rw_max_slave_conn_count,
+                                      min_nsrv);
                         }
                         if (nservers < min_nsrv)
                         {
                             double dbgpct = ((double)min_nsrv/(double)router_nsrv)*100.0;
-                            LOGIF(LE, (skygw_log_write_flush(
-                                        LOGFILE_ERROR,
-                                        "Error : Unable to start %s service. There are "
-                                        "too few backend servers configured in "
-                                        "MaxScale.cnf. Found %d%% when at least %.0f%% "
-                                        "would be required.",
-                                        router->service->name,
-                                        (*p_rses)->rses_config.rw_max_slave_conn_percent,
-                                        dbgpct)));
+                            MXS_ERROR("Unable to start %s service. There are "
+                                      "too few backend servers configured in "
+                                      "MaxScale.cnf. Found %d%% when at least %.0f%% "
+                                      "would be required.",
+                                      router->service->name,
+                                      (*p_rses)->rses_config.rw_max_slave_conn_percent,
+                                      dbgpct);
                         }
                 }
                 free(*p_rses);
@@ -5311,9 +5151,16 @@ static int router_handle_state_switch(
         backend_ref_t*     bref;
         int                rc = 1;
         SERVER*            srv;
-	ROUTER_CLIENT_SES* rses;
-        SESSION*           ses;
         CHK_DCB(dcb);
+    if (NULL == dcb->session->router_session)
+    {
+        /*
+         * The following processing will fail if there is no router session,
+         * because the "data" parameter will not contain meaningful data,
+         * so we have no choice but to stop here.
+         */
+        return 0;
+    }
         bref = (backend_ref_t *)data;
         CHK_BACKEND_REF(bref);
        
@@ -5324,15 +5171,17 @@ static int router_handle_state_switch(
                 goto return_rc;
         }
         
-        LOGIF(LD, (skygw_log_write(LOGFILE_DEBUG,
-			"%lu [router_handle_state_switch] %s %s:%d in state %s",
-			pthread_self(),
-			STRDCBREASON(reason),
-			srv->name,
-			srv->port,
-				STRSRVSTATUS(srv))));
+        MXS_DEBUG("%lu [router_handle_state_switch] %s %s:%d in state %s",
+                  pthread_self(),
+                  STRDCBREASON(reason),
+                  srv->name,
+                  srv->port,
+                  STRSRVSTATUS(srv));
         CHK_SESSION(((SESSION*)dcb->session));
-        CHK_CLIENT_RSES(((ROUTER_CLIENT_SES *)dcb->session->router_session));
+        if (dcb->session->router_session)
+        {
+            CHK_CLIENT_RSES(((ROUTER_CLIENT_SES *)dcb->session->router_session));
+        }
 
         switch (reason) {
                 case DCB_REASON_NOT_RESPONDING:
@@ -5501,11 +5350,9 @@ static backend_ref_t* get_root_master_bref(
 	}
 	if (candidate_bref == NULL)
 	{
-		LOGIF(LE, (skygw_log_write_flush(
-			LOGFILE_ERROR,
-			"Error : Could not find master among the backend "
-			"servers. Previous master's state : %s",
-			STRSRVSTATUS(BREFSRV(rses->rses_master_ref)))));	
+            MXS_ERROR("Could not find master among the backend "
+                      "servers. Previous master's state : %s",
+                      STRSRVSTATUS(BREFSRV(rses->rses_master_ref)));
 	}
 	return candidate_bref;
 }

@@ -67,7 +67,7 @@ static int setipaddress(struct in_addr *a, char *p);
 static int authMaxScale(int so, char *user, char *password);
 static int sendCommand(int so, char *cmd);
 static void DoSource(int so, char *cmd);
-static void DoUsage();
+static void DoUsage(const char*);
 static int isquit(char *buf);
 static void PrintVersion(const char *progname);
 static void read_inifile(char **hostname, char **port, char **user, char **passwd,int*);
@@ -466,7 +466,8 @@ int	i, j, newline = 1;
 		{
 			if (newline == 1 && buf[j] == 'O')
 				newline = 2;
-			else if (newline == 2 && buf[j] == 'K' && j == i - 1)
+			else if ((newline == 2 && buf[j] == 'K' && j == i - 1) ||
+                     (j == i - 2 && buf[j] == 'O' && buf[j + 1] == 'K'))
 			{
 				return 1;
 			}

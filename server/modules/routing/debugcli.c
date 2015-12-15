@@ -61,7 +61,7 @@ static	void 	closeSession(ROUTER *instance, void *router_session);
 static	void 	freeSession(ROUTER *instance, void *router_session);
 static	int	execute(ROUTER *instance, void *router_session, GWBUF *queue);
 static	void	diagnostics(ROUTER *instance, DCB *dcb);
-static  uint8_t getCapabilities (ROUTER* inst, void* router_session);
+static  int getCapabilities ();
 
 /** The module object definition */
 static ROUTER_OBJECT MyObject = {
@@ -99,12 +99,9 @@ version()
 void
 ModuleInit()
 {
-	LOGIF(LM, (skygw_log_write(
-                           LOGFILE_MESSAGE,
-                           "Initialise debug CLI router module %s.\n",
-                           version_str)));
-	spinlock_init(&instlock);
-	instances = NULL;
+    MXS_NOTICE("Initialise debug CLI router module %s.", version_str);
+    spinlock_init(&instlock);
+    instances = NULL;
 }
 
 /**
@@ -158,10 +155,7 @@ int		i;
 			}
 			else
 			{
-				LOGIF(LE, (skygw_log_write(
-					LOGFILE_ERROR,
-					"Unknown option for CLI '%s'\n",
-					options[i])));
+                            MXS_ERROR("Unknown option for CLI '%s'", options[i]);
 			}
 		}
 	}
@@ -310,9 +304,7 @@ diagnostics(ROUTER *instance, DCB *dcb)
 	return;	/* Nothing to do currently */
 }
 
-static uint8_t getCapabilities(
-        ROUTER*  inst,
-        void*    router_session)
+static int getCapabilities()
 {
         return 0;
 }

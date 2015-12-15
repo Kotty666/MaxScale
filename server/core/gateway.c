@@ -166,7 +166,7 @@ static struct option long_options[] = {
     {"cachedir",         required_argument, 0, 'A'},
     {"language",         required_argument, 0, 'N'},
     {"syslog",           required_argument, 0, 's'},
-    {"maxscalelog",      required_argument, 0, 'S'},
+    {"maxlog",          required_argument, 0, 'S'},
     {"user",             required_argument, 0, 'U'},
     {"version",          no_argument,       0, 'v'},
     {"help",             no_argument,       0, '?'},
@@ -174,6 +174,10 @@ static struct option long_options[] = {
     {"log_augmentation", required_argument, 0, 'G'},
     {0, 0, 0, 0}
 };
+static bool syslog_configured = false;
+static bool maxlog_configured = false;
+static bool log_to_shm_configured = false;
+
 static int cnf_preparser(void* data, const char* section, const char* name, const char* value);
 static void log_flush_shutdown(void);
 static void log_flush_cb(void* arg);
@@ -206,7 +210,7 @@ static bool resolve_maxscale_conf_fname(
     char*  cnf_file_arg);
 
 static char* check_dir_access(char* dirname, bool, bool);
-static int set_user();
+static int set_user(const char* user);
 bool pid_file_exists();
 void write_child_exit_code(int fd, int code);
 /** SSL multi-threading functions and structures */
@@ -216,9 +220,13 @@ static SPINLOCK* ssl_locks;
 static void ssl_locking_function(int mode, int n, const char* file, int line)
 {
     if (mode & CRYPTO_LOCK)
+    {
         spinlock_acquire(&ssl_locks[n]);
+    }
     else
+    {
         spinlock_release(&ssl_locks[n]);
+    }
 }
 /**
  * OpenSSL requires this struct to be defined in order to use dynamic locks
@@ -292,9 +300,7 @@ static void maxscale_ssl_id(CRYPTO_THREADID* id)
  */
 static void sighup_handler (int i)
 {
-    LOGIF(LM, (skygw_log_write(
-                   LOGFILE_MESSAGE,
-                   "Refreshing configuration following SIGHUP\n")));
+    MXS_NOTICE("Refreshing configuration following SIGHUP\n");
     config_reload();
 }
 
@@ -304,22 +310,15 @@ static void sighup_handler (int i)
  */
 static void sigusr1_handler (int i)
 {
-    LOGIF(LM, (skygw_log_write(
-                   LOGFILE_MESSAGE,
-                   "Log file flush following reception of SIGUSR1\n")));
-    skygw_log_rotate(LOGFILE_ERROR);
-    skygw_log_rotate(LOGFILE_MESSAGE);
-    skygw_log_rotate(LOGFILE_TRACE);
-    skygw_log_rotate(LOGFILE_DEBUG);
+    MXS_NOTICE("Log file flush following reception of SIGUSR1\n");
+    mxs_log_rotate();
 }
 
 static void sigterm_handler (int i) {
     extern void shutdown_server();
 
-    skygw_log_write_flush(
-        LOGFILE_ERROR,
-        "MaxScale received signal SIGTERM. Exiting.");
-    skygw_log_sync_all();
+    MXS_ERROR("MaxScale received signal SIGTERM. Exiting.");
+    mxs_log_flush_sync();
     shutdown_server();
 }
 
@@ -328,10 +327,8 @@ sigint_handler (int i)
 {
     extern void shutdown_server();
 
-    skygw_log_write_flush(
-        LOGFILE_ERROR,
-        "MaxScale received signal SIGINT. Shutting down.");
-    skygw_log_sync_all();
+    MXS_ERROR("MaxScale received signal SIGINT. Shutting down.");
+    mxs_log_flush_sync();
     shutdown_server();
     fprintf(stderr, "\n\nShutting down MaxScale\n\n");
 }
@@ -345,28 +342,33 @@ sigchld_handler (int i)
     if ((child = wait(&exit_status)) == -1)
     {
         char errbuf[STRERROR_BUFLEN];
-        skygw_log_write_flush(LE, "Error: failed to wait child process: %d %s",
-                              errno, strerror_r(errno, errbuf, sizeof(errbuf)));
+        MXS_ERROR("Failed to wait child process: %d %s",
+                  errno, strerror_r(errno, errbuf, sizeof(errbuf)));
     }
     else
     {
         if (WIFEXITED(exit_status))
         {
-            skygw_log_write_flush(WEXITSTATUS(exit_status) != 0 ? LE : LT,
-                                  "Child process %d exited with status %d",
-                                  child, WEXITSTATUS(exit_status));
+            if (WEXITSTATUS(exit_status) != 0)
+            {
+                MXS_ERROR("Child process %d exited with status %d",
+                          child, WEXITSTATUS(exit_status));
+            }
+            else
+            {
+                MXS_INFO("Child process %d exited with status %d",
+                         child, WEXITSTATUS(exit_status));
+            }
         }
         else if (WIFSIGNALED(exit_status))
         {
-            skygw_log_write_flush((LE|LT),
-                                  "Child process %d was stopped by signal %d.",
-                                  child, WTERMSIG(exit_status));
+            MXS_ERROR("Child process %d was stopped by signal %d.",
+                      child, WTERMSIG(exit_status));
         }
         else
         {
-            skygw_log_write_flush((LE|LT),
-                                  "Child process %d did not exit normally. Exit status: %d",
-                                  child, exit_status);
+            MXS_ERROR("Child process %d did not exit normally. Exit status: %d",
+                      child, exit_status);
         }
     }
 }
@@ -378,7 +380,8 @@ static int signal_set(int sig, void (*handler)(int));
 static void
 sigfatal_handler(int i)
 {
-    if (fatal_handling) {
+    if (fatal_handling)
+    {
         fprintf(stderr, "Fatal signal %d while backtracing\n", i);
         _exit(1);
     }
@@ -386,33 +389,33 @@ sigfatal_handler(int i)
     GATEWAY_CONF* cnf = config_get_global_options();
     fprintf(stderr, "\n\nMaxScale "MAXSCALE_VERSION" received fatal signal %d\n", i);
 
-    skygw_log_write_flush(
-        LOGFILE_ERROR,
-        "Fatal: MaxScale "MAXSCALE_VERSION" received fatal signal %d. Attempting backtrace.", i);
+    MXS_ERROR("Fatal: MaxScale "MAXSCALE_VERSION" received fatal signal %d. Attempting backtrace.", i);
 
-    skygw_log_write_flush(LE, "Commit ID: %s System name: %s "
-                          "Release string: %s Embedded library version: %s",
-                          maxscale_commit, cnf->sysname, cnf->release_string, cnf->version_string);
+    MXS_ERROR("Commit ID: %s System name: %s "
+              "Release string: %s Embedded library version: %s",
+              maxscale_commit, cnf->sysname, cnf->release_string, cnf->version_string);
 
     {
         void *addrs[128];
         int n, count = backtrace(addrs, 128);
         char** symbols = backtrace_symbols(addrs, count);
 
-        if (symbols) {
-            for (n = 0; n < count; n++) {
-                skygw_log_write_flush(
-                    LOGFILE_ERROR,
-                    "  %s\n", symbols[n]);
+        if (symbols)
+        {
+            for (n = 0; n < count; n++)
+            {
+                MXS_ERROR("  %s\n", symbols[n]);
             }
             free(symbols);
-        } else {
+        }
+        else
+        {
             fprintf(stderr, "\nresolving symbols to error log failed, writing call trace to stderr:\n");
             backtrace_symbols_fd(addrs, count, fileno(stderr));
         }
     }
 
-    skygw_log_sync_all();
+    mxs_log_flush_sync();
 
     /* re-raise signal to enforce core dump */
     fprintf(stderr, "\n\nWriting core dump\n");
@@ -435,7 +438,8 @@ sigfatal_handler(int i)
  * @details (write detailed description here)
  *
  */
-static int signal_set(int sig, void (*handler)(int)) {
+static int signal_set(int sig, void (*handler)(int))
+{
     static struct sigaction sigact;
     static int err;
     int rc = 0;
@@ -449,12 +453,10 @@ static int signal_set(int sig, void (*handler)(int)) {
         int eno = errno;
         errno = 0;
         char errbuf[STRERROR_BUFLEN];
-        skygw_log_write_flush(
-            LOGFILE_ERROR,
-            "Error : Failed call sigaction() in %s due to %d, %s.",
-            program_invocation_short_name,
-            eno,
-            strerror_r(eno, errbuf, sizeof(errbuf)));
+        MXS_ERROR("Failed call sigaction() in %s due to %d, %s.",
+                  program_invocation_short_name,
+                  eno,
+                  strerror_r(eno, errbuf, sizeof(errbuf)));
         rc = 1;
     }
     return rc;
@@ -465,11 +467,10 @@ static int signal_set(int sig, void (*handler)(int)) {
 /**
  * Cleanup the temporary data directory we created for the gateway
  */
-int ntfw_cb(
-    const char*        filename,
-    const struct stat* filestat,
-    int                fileflags,
-    struct FTW*        pfwt)
+int ntfw_cb(const char*        filename,
+            const struct stat* filestat,
+            int                fileflags,
+            struct FTW*        pfwt)
 {
     int rc = remove(filename);
 
@@ -478,13 +479,11 @@ int ntfw_cb(
         int eno = errno;
         errno = 0;
         char errbuf[STRERROR_BUFLEN];
-        skygw_log_write(
-            LOGFILE_ERROR,
-            "Error : Failed to remove the data directory %s of "
-            "MaxScale due to %d, %s.",
-            datadir,
-            eno,
-            strerror_r(eno, errbuf, sizeof(errbuf)));
+        MXS_ERROR("Failed to remove the data directory %s of "
+                  "MaxScale due to %d, %s.",
+                  datadir,
+                  eno,
+                  strerror_r(eno, errbuf, sizeof(errbuf)));
     }
     return rc;
 }
@@ -502,7 +501,8 @@ void datadir_cleanup()
 
 static void libmysqld_done(void)
 {
-    if (libmysqld_started) {
+    if (libmysqld_started)
+    {
         mysql_library_end();
     }
 }
@@ -513,8 +513,7 @@ static void write_footer(void)
     file_write_footer(stdout);
 }
 
-static bool file_write_footer(
-    FILE*       outfile)
+static bool file_write_footer(FILE* outfile)
 {
     bool        succp = false;
     size_t      len1;
@@ -530,18 +529,19 @@ static bool file_write_footer(
     return succp;
 }
 
-static bool file_write_header(
-    FILE*       outfile)
+// Documentation says 26 bytes is enough, but 32 is a nice round number.
+#define ASCTIME_BUF_LEN 32
+static bool file_write_header(FILE* outfile)
 {
     bool        succp = false;
     size_t      len1;
     size_t      len2;
     size_t      len3;
     const char* header_buf1;
-    char*       header_buf2 = NULL;
+    char        header_buf2[ASCTIME_BUF_LEN];
     const char* header_buf3;
-    time_t*     t  = NULL;
-    struct tm*  tm = NULL;
+    time_t      t;
+    struct tm   tm;
 #if defined(LAPTOP_TEST)
     struct timespec ts1;
     ts1.tv_sec = 0;
@@ -552,23 +552,11 @@ static bool file_write_header(
     return true;
 #endif
 
-    if ((t = (time_t *)malloc(sizeof(time_t))) == NULL) {
-        goto return_succp;
-    }
-
-    if ((tm = (struct tm *)malloc(sizeof(struct tm))) == NULL) {
-        goto return_succp;
-    }
-
-    *t = time(NULL);
-    *tm = *localtime(t);
+    t = time(NULL);
+    localtime_r(&t, &tm);
 
     header_buf1 = "\n\nMariaDB Corporation MaxScale " MAXSCALE_VERSION "\t";
-    header_buf2 = strdup(asctime(tm));
-
-    if (header_buf2 == NULL) {
-        goto return_succp;
-    }
+    asctime_r(&tm, header_buf2);
     header_buf3 = "------------------------------------------------------\n";
 
     len1 = strlen(header_buf1);
@@ -584,23 +572,12 @@ static bool file_write_header(
 
     succp = true;
 
-return_succp:
-    if (tm != NULL) {
-        free(tm);
-    }
-    if (t != NULL) {
-        free(t);
-    }
-    if (header_buf2 != NULL) {
-        free(header_buf2);
-    }
     return succp;
 }
 
-static bool resolve_maxscale_conf_fname(
-    char** cnf_full_path,
-    char*  home_dir,
-    char*  cnf_file_arg)
+static bool resolve_maxscale_conf_fname(char** cnf_full_path,
+                                        char*  home_dir,
+                                        char*  cnf_file_arg)
 {
     bool  succp = false;
 
@@ -622,9 +599,7 @@ static bool resolve_maxscale_conf_fname(
          * directory.
          * '-f MaxScale.cnf'
          */
-        *cnf_full_path = get_expanded_pathname(NULL,
-                                               home_dir,
-                                               cnf_file_arg);
+        *cnf_full_path = get_expanded_pathname(NULL, home_dir, cnf_file_arg);
 
         if (*cnf_full_path != NULL)
         {
@@ -710,8 +685,7 @@ return_succp:
  * @return NULL if directory can be read and written, an error message if either
  *      read or write is not permitted.
  */
-static char* check_dir_access(
-    char* dirname, bool rd, bool wr)
+static char* check_dir_access(char* dirname, bool rd, bool wr)
 {
     char errbuf[PATH_MAX * 2];
     char* errstr = NULL;
@@ -777,17 +751,17 @@ static void print_log_n_stderr(
     char* fpr_err = "*\n* Error :";
     char* fpr_end   = "\n*\n";
 
-    if (do_log) {
+    if (do_log)
+    {
         char errbuf[STRERROR_BUFLEN];
-        skygw_log_write_flush(
-            LOGFILE_ERROR,
-            "%s %s %s %s",
-            log_err,
-            logstr,
-            eno == 0 ? " " : "Error :",
-            eno == 0 ? " " : strerror_r(eno, errbuf, sizeof(errbuf)));
+        MXS_ERROR("%s %s %s %s",
+                  log_err,
+                  logstr,
+                  eno == 0 ? " " : "Error :",
+                  eno == 0 ? " " : strerror_r(eno, errbuf, sizeof(errbuf)));
     }
-    if (do_stderr) {
+    if (do_stderr)
+    {
         char errbuf[STRERROR_BUFLEN];
         fprintf(stderr,
                 "%s %s %s %s %s",
@@ -799,8 +773,7 @@ static void print_log_n_stderr(
     }
 }
 
-static bool file_is_readable(
-    char* absolute_pathname)
+static bool file_is_readable(char* absolute_pathname)
 {
     bool succp = true;
 
@@ -818,21 +791,18 @@ static bool file_is_readable(
                     absolute_pathname,
                     strerror_r(eno, errbuf, sizeof(errbuf)));
         }
-        skygw_log_write_flush(
-            LOGFILE_ERROR,
-            "Warning : Failed to read the configuration file %s due "
-            "to %d, %s.",
-            absolute_pathname,
-            eno,
-            strerror_r(eno, errbuf, sizeof(errbuf)));
-        skygw_log_sync_all();
+        MXS_WARNING("Failed to read the configuration file %s due "
+                    "to %d, %s.",
+                    absolute_pathname,
+                    eno,
+                    strerror_r(eno, errbuf, sizeof(errbuf)));
+        mxs_log_flush_sync();
         succp = false;
     }
     return succp;
 }
 
-static bool file_is_writable(
-    char* absolute_pathname)
+static bool file_is_writable(char* absolute_pathname)
 {
     bool succp = true;
 
@@ -851,13 +821,11 @@ static bool file_is_writable(
                     eno,
                     strerror_r(eno, errbuf, sizeof(errbuf)));
         }
-        skygw_log_write_flush(
-            LOGFILE_ERROR,
-            "Error : unable to open file %s for write due "
-            "to %d, %s.",
-            absolute_pathname,
-            eno,
-            strerror_r(eno, errbuf, sizeof(errbuf)));
+        MXS_ERROR("Unable to open file %s for write due "
+                  "to %d, %s.",
+                  absolute_pathname,
+                  eno,
+                  strerror_r(eno, errbuf, sizeof(errbuf)));
         succp = false;
     }
     return succp;
@@ -882,13 +850,12 @@ static bool file_is_writable(
  *
  *
  */
-static char* get_expanded_pathname(
-    char** output_path,
-    char*  relative_path,
-    const char*  fname)
+static char* get_expanded_pathname(char** output_path,
+                                   char*  relative_path,
+                                   const char*  fname)
 {
-    char*  cnf_file_buf = NULL;
-    char*  expanded_path;
+    char* cnf_file_buf = NULL;
+    char* expanded_path;
 
     if (relative_path == NULL)
     {
@@ -912,14 +879,11 @@ static char* get_expanded_pathname(
                 relative_path,
                 strerror_r(eno, errbuf, sizeof(errbuf)));
 
-        skygw_log_write_flush(
-            LOGFILE_ERROR,
-            "Warning : Failed to read the "
-            "directory %s, due "
-            "to %d, %s.",
-            relative_path,
-            eno,
-            strerror_r(eno, errbuf, sizeof(errbuf)));
+        MXS_WARNING("Failed to read the directory %s, due "
+                    "to %d, %s.",
+                    relative_path,
+                    eno,
+                    strerror_r(eno, errbuf, sizeof(errbuf)));
         free(expanded_path);
         *output_path = NULL;
         goto return_cnf_file_buf;
@@ -932,9 +896,7 @@ static char* get_expanded_pathname(
          * readability.
          */
         size_t pathlen = strnlen(expanded_path, PATH_MAX)+
-            1+
-            strnlen(fname, PATH_MAX)+
-            1;
+            1 + strnlen(fname, PATH_MAX) + 1;
         cnf_file_buf = (char*)malloc(pathlen);
 
         if (cnf_file_buf == NULL)
@@ -942,10 +904,8 @@ static char* get_expanded_pathname(
             ss_dassert(cnf_file_buf != NULL);
             char errbuf[STRERROR_BUFLEN];
 
-            skygw_log_write_flush(
-                LOGFILE_ERROR,
-                "Error : Memory allocation failed due to %s.",
-                strerror_r(errno, errbuf, sizeof(errbuf)));
+            MXS_ERROR("Memory allocation failed due to %s.",
+                      strerror_r(errno, errbuf, sizeof(errbuf)));
 
             free(expanded_path);
             expanded_path = NULL;
@@ -1008,14 +968,14 @@ static void usage(void)
             "                             (default: /etc/)\n"
             "  -D, --datadir=PATH         path to data directory, stored embedded mysql tables\n"
             "                             (default: /var/cache/maxscale)\n"
-            "  -N, --language=PATH         apth to errmsg.sys file\n"
+            "  -N, --language=PATH         path to errmsg.sys file\n"
             "                             (default: /var/lib/maxscale)\n"
             "  -P, --piddir=PATH          path to PID file directory\n"
             "                             (default: /var/run/maxscale)\n"
             "  -U, --user=USER            run MaxScale as another user.\n"
             "                             The user ID and group ID of this user are used to run MaxScale.\n"
             "  -s, --syslog=[yes|no]      log messages to syslog (default:yes)\n"
-            "  -S, --maxscalelog=[yes|no] log messages to MaxScale log (default: yes)\n"
+            "  -S, --maxlog=[yes|no]      log messages to MaxScale log (default: yes)\n"
             "  -v, --version              print version info and exit\n"
             "  -V, --version-full         print full version info and exit\n"
             "  -?, --help                 show this help\n"
@@ -1077,20 +1037,18 @@ int main(int argc, char **argv)
     char*    tmp_path;
     char*    tmp_var;
     int      option_index;
-    log_target_t log_target = LOG_TARGET_FS;
     int      *syslog_enabled = &config_get_global_options()->syslog; /** Log to syslog */
-    int      *maxscalelog_enabled = &config_get_global_options()->maxlog; /** Log with MaxScale */
+    int      *maxlog_enabled = &config_get_global_options()->maxlog; /** Log with MaxScale */
+    int      *log_to_shm = &config_get_global_options()->log_to_shm; /** Log to shared memory */
     ssize_t  log_flush_timeout_ms = 0;
     sigset_t sigset;
     sigset_t sigpipe_mask;
     sigset_t saved_mask;
-    void   (*exitfunp[4])(void) = {skygw_logmanager_exit,
-                                   datadir_cleanup,
-                                   write_footer,
-                                   NULL};
+    void   (*exitfunp[4])(void) = { mxs_log_finish, datadir_cleanup, write_footer, NULL };
 
     *syslog_enabled = 1;
-    *maxscalelog_enabled = 1;
+    *maxlog_enabled = 1;
+    *log_to_shm = 0;
 
     sigemptyset(&sigpipe_mask);
     sigaddset(&sigpipe_mask, SIGPIPE);
@@ -1169,9 +1127,15 @@ int main(int argc, char **argv)
 
         case 'l':
             if (strncasecmp(optarg, "file", PATH_MAX) == 0)
-                log_target = LOG_TARGET_FS;
+            {
+                *log_to_shm = false;
+                log_to_shm_configured = true;
+            }
             else if (strncasecmp(optarg, "shm", PATH_MAX) == 0)
-                log_target = LOG_TARGET_SHMEM;
+            {
+                *log_to_shm = true;
+                log_to_shm_configured = true;
+            }
             else
             {
                 char* logerr = "Configuration file argument "
@@ -1258,11 +1222,15 @@ int main(int argc, char **argv)
             {
                 tok++;
                 if (tok)
-                    *maxscalelog_enabled = config_truth_value(tok);
+                {
+                    *maxlog_enabled = config_truth_value(tok);
+                    maxlog_configured = true;
+                }
             }
             else
             {
-                *maxscalelog_enabled = config_truth_value(optarg);
+                *maxlog_enabled = config_truth_value(optarg);
+                maxlog_configured = true;
             }
         }
         break;
@@ -1273,11 +1241,15 @@ int main(int argc, char **argv)
             {
                 tok++;
                 if (tok)
+                {
                     *syslog_enabled = config_truth_value(tok);
+                    syslog_configured = true;
+                }
             }
             else
             {
                 *syslog_enabled = config_truth_value(optarg);
+                syslog_configured = true;
             }
         }
         break;
@@ -1656,7 +1628,9 @@ int main(int argc, char **argv)
     snprintf(pathbuf, PATH_MAX, "%s", get_configdir());
     pathbuf[PATH_MAX] = '\0';
     if (pathbuf[strlen(pathbuf) - 1] != '/')
+    {
         strcat(pathbuf, "/");
+    }
 
     if (!resolve_maxscale_conf_fname(&cnf_file_path, pathbuf, cnf_file_arg))
     {
@@ -1678,11 +1652,10 @@ int main(int argc, char **argv)
             snprintf(errorbuffer, sizeof(errorbuffer),
                      "Error: Failed to pre-parse configuration file. Memory allocation failed.");
 
-        skygw_log_write(LE, errorbuffer);
+        MXS_ERROR("%s", errorbuffer);
         if (!daemon_mode)
         {
-            strncat(errorbuffer, "\n", STRING_BUFFER_SIZE);
-            fprintf(stderr, "%s", errorbuffer);
+            fprintf(stderr, "%s\n", errorbuffer);
         }
 
         rc = MAXSCALE_BADCONFIG;
@@ -1715,14 +1688,17 @@ int main(int argc, char **argv)
             printf("Syslog logging is disabled.\n");
         }
 
-        if (!(*maxscalelog_enabled))
+        if (!(*maxlog_enabled))
         {
             printf("MaxScale logging is disabled.\n");
         }
-        logmanager_enable_syslog(*syslog_enabled);
-        logmanager_enable_maxscalelog(*maxscalelog_enabled);
 
-        succp = skygw_logmanager_init(NULL, get_logdir(), log_target);
+        mxs_log_set_syslog_enabled(*syslog_enabled);
+        mxs_log_set_maxlog_enabled(*maxlog_enabled);
+
+        mxs_log_target_t log_target = *log_to_shm ? MXS_LOG_TARGET_SHMEM : MXS_LOG_TARGET_FS;
+
+        succp = mxs_log_init(NULL, get_logdir(), log_target);
 
         if (!succp)
         {
@@ -1780,29 +1756,11 @@ int main(int argc, char **argv)
                 get_cachedir());
     }
 
-    LOGIF(LM,
-          (skygw_log_write_flush(
-              LOGFILE_MESSAGE,
-              "Configuration file: %s",
-              cnf_file_path)));
-    LOGIF(LM,
-          (skygw_log_write_flush(
-              LOGFILE_MESSAGE,
-              "Log directory: %s/",
-              get_logdir())));
-    LOGIF(LM,
-          (skygw_log_write_flush(
-              LOGFILE_MESSAGE,
-              "Data directory: %s",
-              get_datadir())));
-    LOGIF(LM,
-          (skygw_log_write_flush(LOGFILE_MESSAGE,
-                                 "Module directory: %s",
-                                 get_libdir())));
-    LOGIF(LM,
-          (skygw_log_write_flush(LOGFILE_MESSAGE,
-                                 "Service cache: %s",
-                                 get_cachedir())));
+    MXS_NOTICE("Configuration file: %s", cnf_file_path);
+    MXS_NOTICE("Log directory: %s", get_logdir());
+    MXS_NOTICE("Data directory: %s", get_datadir());
+    MXS_NOTICE("Module directory: %s", get_libdir());
+    MXS_NOTICE("Service cache: %s", get_cachedir());
 
     /*< Update the server options */
     for (i = 0; server_options[i]; i++)
@@ -1859,15 +1817,13 @@ int main(int argc, char **argv)
                 }
             }
         }
-        skygw_log_write_flush(
-            LOGFILE_ERROR,
-            "Error : mysql_library_init failed. It is a "
-            "mandatory component, required by router services and "
-            "the MaxScale core. Error %d, %s, %s : %d. Exiting.",
-            mysql_errno(NULL),
-            mysql_error(NULL),
-            __FILE__,
-            __LINE__);
+        MXS_ERROR("mysql_library_init failed. It is a "
+                  "mandatory component, required by router services and "
+                  "the MaxScale core. Error %d, %s, %s : %d. Exiting.",
+                  mysql_errno(NULL),
+                  mysql_error(NULL),
+                  __FILE__,
+                  __LINE__);
         rc = MAXSCALE_NOLIBRARY;
         goto return_main;
     }
@@ -1875,25 +1831,18 @@ int main(int argc, char **argv)
 
     if (!config_load(cnf_file_path))
     {
-        char* fprerr = "Failed to load MaxScale configuration "
+        char* fprerr =
+            "Failed to open, read or process the MaxScale configuration "
             "file. Exiting. See the error log for details.";
         print_log_n_stderr(false, !daemon_mode, fprerr, fprerr, 0);
-        skygw_log_write_flush(
-            LOGFILE_ERROR,
-            "Error : Failed to load MaxScale configuration file %s. "
-            "Exiting.",
-            cnf_file_path);
+        MXS_ERROR("Failed to open, read or process the MaxScale configuration file %s. "
+                  "Exiting.",
+                  cnf_file_path);
         rc = MAXSCALE_BADCONFIG;
         goto return_main;
     }
-    LOGIF(LM, (skygw_log_write(
-                   LOGFILE_MESSAGE,
-                   "MariaDB Corporation MaxScale %s (C) MariaDB Corporation Ab 2013-2015",
-                   MAXSCALE_VERSION)));
-    LOGIF(LM, (skygw_log_write(
-                   LOGFILE_MESSAGE,
-                   "MaxScale is running in process  %i",
-                   getpid())));
+    MXS_NOTICE("MariaDB Corporation MaxScale %s (C) MariaDB Corporation Ab 2013-2015", MAXSCALE_VERSION);
+    MXS_NOTICE("MaxScale is running in process %i", getpid());
 
     /** Check if a MaxScale process is already running */
     if (pid_file_exists())
@@ -1957,9 +1906,7 @@ int main(int argc, char **argv)
     {
         threads[thread_id] = thread_start(poll_waitevents, (void *)(thread_id + 1));
     }
-    LOGIF(LM, (skygw_log_write(LOGFILE_MESSAGE,
-                               "MaxScale started with %d server threads.",
-                               config_threadcount())));
+    MXS_NOTICE("MaxScale started with %d server threads.", config_threadcount());
     /**
      * Successful start, notify the parent process that it can exit.
      */
@@ -1988,16 +1935,12 @@ int main(int argc, char **argv)
     /*< Stop all the monitors */
     monitorStopAll();
 
-    LOGIF(LM, (skygw_log_write(
-                   LOGFILE_MESSAGE,
-                   "MaxScale is shutting down.")));
+    MXS_NOTICE("MaxScale is shutting down.");
     /** Release mysql thread context*/
     mysql_thread_end();
 
     datadir_cleanup();
-    LOGIF(LM, (skygw_log_write(
-                   LOGFILE_MESSAGE,
-                   "MaxScale shutdown completed.")));
+    MXS_NOTICE("MaxScale shutdown completed.");
 
     unload_all_modules();
     /* Remove Pidfile */
@@ -2048,8 +1991,7 @@ static void log_flush_shutdown(void)
  *
  *
  */
-static void log_flush_cb(
-    void* arg)
+static void log_flush_cb(void* arg)
 {
     ssize_t timeout_ms = *(ssize_t *)arg;
     struct timespec ts1;
@@ -2057,17 +1999,13 @@ static void log_flush_cb(
     ts1.tv_sec = timeout_ms/1000;
     ts1.tv_nsec = (timeout_ms%1000) * 1000000;
 
-    LOGIF(LM, (skygw_log_write(LOGFILE_MESSAGE,
-                               "Started MaxScale log flusher.")));
-    while (!do_exit) {
-        skygw_log_flush(LOGFILE_ERROR);
-        skygw_log_flush(LOGFILE_MESSAGE);
-        skygw_log_flush(LOGFILE_TRACE);
-        skygw_log_flush(LOGFILE_DEBUG);
+    MXS_NOTICE("Started MaxScale log flusher.");
+    while (!do_exit)
+    {
+        mxs_log_flush();
         nanosleep(&ts1, NULL);
     }
-    LOGIF(LM, (skygw_log_write(LOGFILE_MESSAGE,
-                               "Finished MaxScale log flusher.")));
+    MXS_NOTICE("Finished MaxScale log flusher.");
 }
 
 static void unlock_pidfile()
@@ -2090,7 +2028,8 @@ static void unlock_pidfile()
  */
 static void unlink_pidfile(void)
 {
-    if (strlen(pidfile)) {
+    if (strlen(pidfile))
+    {
         if (unlink(pidfile))
         {
             char errbuf[STRERROR_BUFLEN];
@@ -2122,7 +2061,9 @@ bool pid_file_exists()
     pathbuf[PATH_MAX] = '\0';
 
     if (access(pathbuf, F_OK) != 0)
+    {
         return false;
+    }
 
     if (access(pathbuf, R_OK) == 0)
     {
@@ -2314,7 +2255,9 @@ bool handle_path_arg(char** dest, char* path, char* arg, bool rd, bool wr)
     bool rval = false;
 
     if (path == NULL && arg == NULL)
+    {
         return rval;
+    }
 
     if (path)
     {
@@ -2351,7 +2294,7 @@ void set_log_augmentation(const char* value)
 
     if (!augmentation_set)
     {
-        skygw_log_set_augmentation(atoi(value));
+        mxs_log_set_augmentation(atoi(value));
 
         augmentation_set = true;
     }
@@ -2462,22 +2405,35 @@ static int cnf_preparser(void* data, const char* section, const char* name, cons
         }
         else if (strcmp(name, "syslog") == 0)
         {
-            cnf->syslog = config_truth_value((char*)value);
+            if (!syslog_configured)
+            {
+                cnf->syslog = config_truth_value((char*)value);
+            }
         }
         else if (strcmp(name, "maxlog") == 0)
         {
-            cnf->maxlog = config_truth_value((char*)value);
+            if (!maxlog_configured)
+            {
+                cnf->maxlog = config_truth_value((char*)value);
+            }
         }
         else if (strcmp(name, "log_augmentation") == 0)
         {
             set_log_augmentation(value);
+        }
+        else if (strcmp(name, "log_to_shm") == 0)
+        {
+            if (!log_to_shm_configured)
+            {
+                cnf->log_to_shm = config_truth_value((char*)value);
+            }
         }
     }
 
     return 1;
 }
 
-static int set_user(char* user)
+static int set_user(const char* user)
 {
     errno = 0;
     struct passwd *pwname;

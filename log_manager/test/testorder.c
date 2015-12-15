@@ -23,6 +23,16 @@
 #include <skygw_utils.h>
 #include <log_manager.h>
 
+static void skygw_log_enable(int priority)
+{
+    mxs_log_set_priority_enabled(priority, true);
+}
+
+static void skygw_log_disable(int priority)
+{
+    mxs_log_set_priority_enabled(priority, false);
+}
+
 int main(int argc, char** argv)
 {
     int iterations = 0, i, interval = 10;
@@ -67,7 +77,7 @@ int main(int argc, char** argv)
     iterations = atoi(argv[1]);
     interval = atoi(argv[2]);
 
-    succp = skygw_logmanager_init(NULL, tmp, LOG_TARGET_FS);
+    succp = mxs_log_init(NULL, tmp, MXS_LOG_TARGET_FS);
 
     if (!succp)
     {
@@ -75,9 +85,9 @@ int main(int argc, char** argv)
     }
     ss_dassert(succp);
 
-    skygw_log_disable(LOGFILE_TRACE);
-    skygw_log_disable(LOGFILE_MESSAGE);
-    skygw_log_disable(LOGFILE_DEBUG);
+    skygw_log_disable(LOG_INFO);
+    skygw_log_disable(LOG_NOTICE);
+    skygw_log_disable(LOG_DEBUG);
 
     for (i = 0; i < iterations; i++)
     {
@@ -92,11 +102,11 @@ int main(int argc, char** argv)
         memset(message + block_size - 1, '\0', 1);
         if (interval > 0 && i % interval == 0)
         {
-            err = skygw_log_write_flush(LOGFILE_ERROR, message);
+            err = MXS_ERROR("%s", message);
         }
         else
         {
-            err = skygw_log_write(LOGFILE_ERROR, message);
+            err = MXS_ERROR("%s", message);
         }
         if (err)
         {
@@ -107,8 +117,8 @@ int main(int argc, char** argv)
         nanosleep(&ts1, NULL);
     }
 
-    skygw_log_flush(LOGFILE_ERROR);
-    skygw_logmanager_done();
+    mxs_log_flush();
+    mxs_log_finish();
     free(message);
     return 0;
 }

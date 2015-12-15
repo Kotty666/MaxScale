@@ -116,9 +116,7 @@ version()
 void
 ModuleInit()
 {
-	LOGIF(LT, (skygw_log_write(
-                           LOGFILE_TRACE,
-                           "Initialise Telnetd Protocol module.\n")));
+    MXS_INFO("Initialise Telnetd Protocol module.");
 }
 
 /**
@@ -306,6 +304,11 @@ int	n_connect = 0;
 			memcpy(&client_dcb->func, &MyObject, sizeof(GWPROTOCOL));
 			client_dcb->session =
                                 session_alloc(dcb->session->service, client_dcb);
+                        if (NULL == client_dcb->session)
+                        {
+                            dcb_close(client_dcb);
+                            return n_connect;
+                        }
                         telnetd_pr = (TELNETD *)malloc(sizeof(TELNETD));
                         client_dcb->protocol = (void *)telnetd_pr;
 
@@ -377,7 +380,8 @@ int			syseno = 0;
 	
 	if(syseno != 0){
                 char errbuf[STRERROR_BUFLEN];
-		LOGIF(LE, (skygw_log_write_flush(LOGFILE_ERROR,"Error: Failed to set socket options. Error %d: %s", errno, strerror_r(errno, errbuf, sizeof(errbuf)))));
+		MXS_ERROR("Failed to set socket options. Error %d: %s",
+                          errno, strerror_r(errno, errbuf, sizeof(errbuf)));
 		return 0;
 	}
         // set NONBLOCKING mode
@@ -391,7 +395,7 @@ int			syseno = 0;
         rc = listen(listener->fd, SOMAXCONN);
         
         if (rc == 0) {
-		LOGIF(LM, (skygw_log_write_flush(LOGFILE_MESSAGE,"Listening telnet connections at %s", config)));
+            MXS_NOTICE("Listening telnet connections at %s", config);
         } else {
             int eno = errno;
             errno = 0;

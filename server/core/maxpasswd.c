@@ -51,7 +51,7 @@ main(int argc, char **argv)
         return 1;
     }
 
-    skygw_logmanager_init(NULL, NULL, LOG_TARGET_DEFAULT);
+    mxs_log_init(NULL, NULL, MXS_LOG_TARGET_DEFAULT);
 
     pw = calloc(81, sizeof(char));
 
@@ -74,7 +74,7 @@ main(int argc, char **argv)
     }
 
     free(pw);
-    skygw_log_sync_all();
-    skygw_logmanager_done();
+    mxs_log_flush_sync();
+    mxs_log_finish();
     return rval;
 }

@@ -8,14 +8,14 @@ endfunction()
 macro(set_maxscale_version)
 
   # MaxScale version number
-  set(MAXSCALE_VERSION_MAJOR "1")
-  set(MAXSCALE_VERSION_MINOR "2")
-  set(MAXSCALE_VERSION_PATCH "0")
+  set(MAXSCALE_VERSION_MAJOR "1" CACHE STRING "Major version")
+  set(MAXSCALE_VERSION_MINOR "3" CACHE STRING "Minor version")
+  set(MAXSCALE_VERSION_PATCH "0" CACHE STRING "Patch version")
   set(MAXSCALE_VERSION_NUMERIC "${MAXSCALE_VERSION_MAJOR}.${MAXSCALE_VERSION_MINOR}.${MAXSCALE_VERSION_PATCH}")
-  set(MAXSCALE_VERSION "${MAXSCALE_VERSION_MAJOR}.${MAXSCALE_VERSION_MINOR}.${MAXSCALE_VERSION_PATCH}")
+  set(MAXSCALE_VERSION "beta-${MAXSCALE_VERSION_MAJOR}.${MAXSCALE_VERSION_MINOR}.${MAXSCALE_VERSION_PATCH}")
 
   # This should be incremented each time a package is rebuilt
-  set(MAXSCALE_BUILD_NUMBER 1)
+  set(MAXSCALE_BUILD_NUMBER 1 CACHE STRING "Release number")
 endmacro()
 
 macro(set_variables)
@@ -57,10 +57,13 @@ macro(set_variables)
   set(STATIC_EMBEDDED TRUE CACHE BOOL "Use static version of libmysqld")
 
   # Build RabbitMQ components
-  set(BUILD_RABBITMQ FALSE CACHE BOOL "Build RabbitMQ components")
+  set(BUILD_RABBITMQ TRUE CACHE BOOL "Build RabbitMQ components")
 
   # Build the binlog router
   set(BUILD_BINLOG TRUE CACHE BOOL "Build binlog router")
+
+  # Build the multimaster monitor
+  set(BUILD_MMMON FALSE CACHE BOOL "Build multimaster monitor")
 
   # Use gcov build flags
   set(GCOV FALSE CACHE BOOL "Use gcov build flags")

@@ -48,7 +48,7 @@ _RETVAL_STATUS_NOT_RUNNING=3
 #################################
 NAME=maxscale
 DAEMON=@CMAKE_INSTALL_PREFIX@/@MAXSCALE_BINDIR@/maxscale
-DAEMON_OPTS='--user=maxscale $MAXSCALE_OPTIONS'
+DAEMON_OPTS='"--user=maxscale" "$MAXSCALE_OPTIONS"'
 
 # Source function library.
 . /lib/lsb/init-functions
@@ -81,10 +81,10 @@ start() {
         mkdir -p @MAXSCALE_VARDIR@/run/maxscale
     fi
 
-    chown maxscale:maxscale @MAXSCALE_VARDIR@/log/maxscale
-    chown maxscale:maxscale @MAXSCALE_VARDIR@/lib/maxscale
-    chown maxscale:maxscale @MAXSCALE_VARDIR@/cache/maxscale
-    chown maxscale:maxscale @MAXSCALE_VARDIR@/run/maxscale
+    chown -R maxscale:maxscale @MAXSCALE_VARDIR@/log/maxscale
+    chown -R maxscale:maxscale @MAXSCALE_VARDIR@/lib/maxscale
+    chown -R maxscale:maxscale @MAXSCALE_VARDIR@/cache/maxscale
+    chown -R maxscale:maxscale @MAXSCALE_VARDIR@/run/maxscale
     chmod 0755 @MAXSCALE_VARDIR@/log/maxscale
     chmod 0755 @MAXSCALE_VARDIR@/lib/maxscale
     chmod 0755 @MAXSCALE_VARDIR@/cache/maxscale
