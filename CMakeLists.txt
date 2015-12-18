@@ -181,6 +181,8 @@ add_subdirectory(server)
 if(NOT WITHOUT_MAXADMIN)
   add_subdirectory(client)
 endif()
+add_subdirectory(plugin_process/client)
+add_subdirectory(plugin_process/src)
 
 # Generate text versions of some documents
 execute_process(COMMAND perl ${CMAKE_SOURCE_DIR}/Documentation/format.pl 

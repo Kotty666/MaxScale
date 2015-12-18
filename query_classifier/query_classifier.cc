@@ -60,6 +60,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#define SIMULATE_OUT_OF_PROCESS_PARSING
+#ifdef SIMULATE_OUT_OF_PROCESS_PARSING
+#include <pp_io.h>
+#endif
 
 #define QTYPE_LESS_RESTRICTIVE_THAN_WRITE(t) (t<QUERY_TYPE_WRITE ? true : false)
 
@@ -72,6 +76,98 @@ static bool skygw_stmt_causes_implicit_commit(LEX* lex, int* autocommit_stmt);
 static int is_autocommit_stmt(LEX* lex);
 static void parsing_info_set_plain_str(void* ptr, char* str);
 static void* skygw_get_affected_tables(void* lexptr);
+
+#ifdef SIMULATE_OUT_OF_PROCESS_PARSING
+
+__thread bool pp_setup = false;
+__thread int  pp_sd = 0;
+
+void pp_connect()
+{
+    char buf[STRERROR_BUFLEN];
+    const char* socket_path = getenv("PP_SOCKET_PATH");
+
+    if (socket_path)
+    {
+        int sd = socket(AF_UNIX, SOCK_STREAM, 0);
+
+        if (sd != -1)
+        {
+            struct sockaddr_un address;
+            memset(&address, 0, sizeof(address));
+            address.sun_family = AF_UNIX;
+            strncpy(address.sun_path, socket_path, sizeof(address.sun_path) - 1);
+            address.sun_path[sizeof(address.sun_path) - 1] = 0;
+
+            if (connect(sd, (struct sockaddr*) &address, sizeof(address)) == 0)
+            {
+                MXS_NOTICE("Connected to plugin process. Note, there'll be one notice per thread.");
+                pp_sd = sd;
+            }
+            else
+            {
+                MXS_ERROR("Could not connect to plugin process. "
+                          "Restart of MaxScale is needed for to recover.");
+                close(sd);
+            }
+        }
+        else
+        {
+            MXS_ERROR("Could not create plugin process socket: %s. "
+                      "Restart of MaxScale is needed to recover.",
+                      strerror_r(errno, buf, sizeof(buf)));
+        }
+    }
+    else
+    {
+        MXS_NOTICE("No PP_SOCKET_PATH environment variable defined. "
+                   "Plugin process behaviour will not be simulated. "
+                   "Restart of MaxScale is needed for recovery.");
+    }
+
+    pp_setup = true;
+}
+
+void pp_roundtrip(const char* query_str, uint32_t len)
+{
+    if (!pp_setup)
+    {
+        pp_connect();
+    }
+
+    // If pp_sd is non-NULL we have a connection. Attempt to connect will only
+    // be made once.
+    if (pp_sd)
+    {
+        if (pp_send(pp_sd, query_str, len) == 0)
+        {
+            char* presponse;
+            uint32_t res_len;
+
+            if (pp_recv(pp_sd, (void**) &presponse, &res_len) == 0)
+            {
+                MXS_NOTICE("Communicated with plugin process.");
+
+                free(presponse);
+            }
+            else
+            {
+                MXS_NOTICE("Could not receive data from plugin process, "
+                           "terminating connection. Restart needed to recover.");
+                close(pp_sd);
+                pp_sd = 0;
+            }
+        }
+        else
+        {
+            MXS_NOTICE("Could not send data to plugin process, "
+                       "terminating connection. Restart needed to recover.");
+            close(pp_sd);
+            pp_sd = 0;
+        }
+    }
+}
+#endif
 
 /**
  * Calls parser for the query includede in the buffer. Creates and adds parsing
@@ -178,6 +274,10 @@ bool parse_query(GWBUF* querybuf)
     memcpy(query_str, &data[5], len);
     memset(&query_str[len], 0, 1);
     parsing_info_set_plain_str(pi, query_str);
+
+#ifdef SIMULATE_OUT_OF_PROCESS_PARSING
+    pp_roundtrip(query_str, len + 1);
+#endif
 
     /** Get one or create new THD object to be use in parsing */
     thd = get_or_create_thd_for_parsing((MYSQL *) pi->pi_handle, query_str);
