@@ -2,7 +2,7 @@ maxscale (1.2.1-1) wheezy; urgency=low
 
   * wheezy build
 
- -- Philipp Frik <philipp.frik@1und1.de>  Fri, 11 Dec 2015 13:16:40 +0000
+ -- Philipp Frik <kotty@guns-n-girls.de>  Fri, 11 Dec 2015 13:16:40 +0000
 
 maxscale (1.2.1-0) trusty; urgency=medium
 
