@@ -1,0 +1,21 @@
+Source: maxscale
+Maintainer: Philipp Frik <philipp@frik.info>
+Section: database
+Priority: optional
+Build-Depends: debhelper (>=9.0.0), libssl-dev, libaio-dev, ncurses-dev, bison, cmake, perl, libtool, librabbitmq-dev, libmariadbclient-dev (>= 5.5), libmariadbclient-dev (<< 10.1), libmariadbd-dev (>= 5.5), libmariadbd-dev (<< 10.1), mariadb-client-core-5.5 | mariadb-client-core-10.0, libpcre3-dev, libcurl4-openssl-dev, libedit-dev, chrpath
+Standards-Version: 3.9.5
+
+Package: maxscale
+Architecture: amd64
+Depends: libmariadbclient (>= 5.5) | libmysqlclient18
+Description: content aware, plug-able database proxy server.
+ MaxScale is a database proxy server that can be used to front end
+ database clusters offering different routing, filtering and protocol choices
+
+Package: nagios-plugins-maxscale
+Architecture: all
+Depends: ${misc:Depends}, ${perl:Depends}, maxscale
+Description: plugins to monitor maxscale status
+ Monitoring plugins to check status of MaxScale monitors
+ (check_maxscale_monitors.pl), resources (check_maxscale_resources.pl),
+ threads and events (check_maxscale_threads.pl).

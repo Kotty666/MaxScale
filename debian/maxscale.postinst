@@ -1,0 +1,21 @@
+#!/bin/sh
+set -e
+
+if test "$1" = "configure"; then
+    if ! getent passwd maxscale > /dev/null; then
+        adduser --quiet --system --group --no-create-home --home /var/lib/maxscale maxscale
+    fi
+    if ! dpkg-statoverride --list /var/lib/maxscale >/dev/null; then
+        dpkg-statoverride --update --add maxscale maxscale 0755 /var/lib/maxscale >/dev/null 2>/dev/null || true
+    fi
+    if ! dpkg-statoverride --list /var/lib/maxscale/log >/dev/null; then
+        dpkg-statoverride --update --add maxscale maxscale 0755 /var/lib/maxscale/log >/dev/null 2>/dev/null || true
+    fi
+    if ! dpkg-statoverride --list /var/log/maxscale >/dev/null; then
+        dpkg-statoverride --update --add maxscale maxscale 0755 /var/log/maxscale >/dev/null 2>/dev/null || true
+    fi
+fi
+
+#DEBHELPER#
+
+exit 0

@@ -1,0 +1,38 @@
+Description: Adjust default location of the maxadmin binary
+ This package installs maxadmin binary to /usr/sbin. Adjust defaults in monitoring
+ scripts accordingly.
+Author: André Keller <andre.keller@vshn.ch>
+
+--- maxscale-1.1.1.orig/plugins/nagios/check_maxscale_monitors.pl
++++ maxscale-1.1.1/plugins/nagios/check_maxscale_monitors.pl
+@@ -70,7 +70,7 @@ EOF
+ 	'u' => 'root',			# username
+ 	'p' => '',			# password
+ 	'P' => 6603,			# port
+-	'm' => '/usr/local/mariadb-maxscale/bin/maxadmin',	# maxadmin
++	'm' => '/usr/sbin/maxadmin',	# maxadmin
+ 	);
+ 
+ my $MAXADMIN_DEFAULT = $opts{'m'};
+--- maxscale-1.1.1.orig/plugins/nagios/check_maxscale_resources.pl
++++ maxscale-1.1.1/plugins/nagios/check_maxscale_resources.pl
+@@ -70,7 +70,7 @@ EOF
+ 	'u' => 'root',			# username
+ 	'p' => '',			# password
+ 	'P' => 6603,			# port
+-	'm' => '/usr/local/mariadb-maxscale/bin/maxadmin',	# maxadmin
++	'm' => '/usr/sbin/maxadmin',	# maxadmin
+ 	);
+ 
+ my $MAXADMIN_DEFAULT = $opts{'m'};
+--- maxscale-1.1.1.orig/plugins/nagios/check_maxscale_threads.pl
++++ maxscale-1.1.1/plugins/nagios/check_maxscale_threads.pl
+@@ -70,7 +70,7 @@ EOF
+ 	'u' => 'root',			# username
+ 	'p' => '',			# password
+ 	'P' => 6603,			# port
+-	'm' => '/usr/local/mariadb-maxscale/bin/maxadmin',	# maxadmin
++	'm' => '/usr/sbin/maxadmin',	# maxadmin
+ 	);
+ 
+ my $MAXADMIN_DEFAULT = $opts{'m'};

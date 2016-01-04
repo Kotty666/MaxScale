@@ -1,0 +1,19 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@ --buildsystem=cmake --builddirectory=build
+
+override_dh_auto_configure:
+	dh_auto_configure -- -DBUILD_BINLOG=TRUE -DSTATIC_EMBEDDED=FALSE -DWITH_SCRIPTS=TRUE -DMYSQLCLIENT_LIBRARIES=/usr/lib/x86_64-linux-gnu/libmariadbclient.so -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/lib/maxscale -DCMAKE_SKIP_INSTALL_RPATH=TRUE -DBUILD_RABBITMQ=TRUE -DMAXSCALE_CONFDIR=/etc/maxscale
+
+override_dh_auto_install:
+	mkdir -p $$(pwd)/debian/maxscale/var/lib/maxscale
+	mkdir -p $$(pwd)/debian/maxscale/var/log/maxscale
+	cp /usr/share/mysql/english/errmsg.sys $$(pwd)/debian/maxscale/var/lib/maxscale
+
+override_dh_shlibdeps:
+	chrpath -r /usr/lib/maxscale $$(pwd)/debian/maxscale/usr/lib/maxscale/lib/x86_64-linux-gnu/maxscale/*.so
+	chrpath -r /usr/lib/maxscale $$(pwd)/debian/maxscale/usr/sbin/maxkeys
+	chrpath -r /usr/lib/maxscale $$(pwd)/debian/maxscale/usr/sbin/maxpasswd
+	chrpath -r /usr/lib/maxscale $$(pwd)/debian/maxscale/usr/sbin/maxscale
+	dh_shlibdeps 
